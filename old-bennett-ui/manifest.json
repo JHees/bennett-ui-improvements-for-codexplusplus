@@ -1,0 +1,18 @@
+{
+  "id": "co.bennett.ui-improvements",
+  "name": "Bennett's UI Improvements",
+  "version": "1.0.3",
+  "githubRepo": "b-nnett/codex-plusplus-bennett-ui",
+  "description": "Quality-of-life UI tweaks for Codex: hide upgrade prompts, surface usage and message metrics.",
+  "author": {
+    "name": "bennett",
+    "url": "https://github.com/anomalyco/codex-plusplus"
+  },
+  "tags": [
+    "ui",
+    "usage",
+    "upgrade"
+  ],
+  "scope": "both",
+  "main": "index.js"
+}
