@@ -11,7 +11,7 @@
     "settings",
     "polish"
   ],
-  "homepage": "https://github.com/b-nnett/codex-plusplus-bennett-ui",
-  "script_url": "https://example.com/path/to/bennett-ui-improvements.js",
+  "homepage": "https://github.com/JHees/bennett-ui-improvements-for-codexplusplus",
+  "script_url": "https://raw.githubusercontent.com/BigPizzaV3/CodexPlusPlusScriptMarket/main/scripts/bennett-ui-improvements.js",
   "sha256": "4c13009815d74b9aa911e80660cf70596c87340d2ed2f194dbe37915f9cc969f"
 }
