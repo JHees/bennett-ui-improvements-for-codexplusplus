@@ -1,4 +1,4 @@
-﻿param(
+param(
   [string]$Source = "old-bennett-ui\index.js",
   [string]$Out = "scripts\bennett-ui-improvements.js"
 )
@@ -220,12 +220,14 @@ $sourceText = $sourceText.Replace(@'
         .trim()
         .toLowerCase();
 
-    const isSettingsOrDeviceButton = (button) => {
+    const isDeviceButton = (button) => {
       const text = controlText(button);
-      return (
-        /\bsettings?\b|preferences?|设置|偏好/.test(text) ||
-        /\bmobile\b|\bphone\b|\bdevice\b|手机|移动|设备|连接/.test(text)
-      );
+      return /\bmobile\b|\bphone\b|\bdevice\b|手机|移动|设备|连接/.test(text);
+    };
+
+    const isSettingsButton = (button) => {
+      const text = controlText(button);
+      return /\bsettings?\b|preferences?|设置|偏好/.test(text);
     };
 
     const nearestControlRow = (sidebar, button) => {
@@ -257,7 +259,9 @@ $sourceText = $sourceText.Replace(@'
       slot.dataset.codexpp = "usage-slot";
       slot.dataset.codexppUsageSlot = "controls-inline";
       slot.className = "flex shrink-0 items-center";
-      if (anchor?.parentElement === row) row.insertBefore(slot, anchor);
+      if (anchor?.parentElement === row) {
+        row.insertBefore(slot, anchor.nextSibling);
+      }
       else row.appendChild(slot);
       return slot;
     };
@@ -270,7 +274,9 @@ $sourceText = $sourceText.Replace(@'
 
       const controls = Array.from(sidebar.querySelectorAll('button, a, [role="button"]'))
         .filter((button) => button instanceof HTMLElement && isVisibleElement(button));
-      const preferredControls = controls.filter(isSettingsOrDeviceButton);
+      const deviceControls = controls.filter(isDeviceButton);
+      const settingsControls = controls.filter(isSettingsButton);
+      const preferredControls = deviceControls.length ? deviceControls : settingsControls;
       const ordered = (preferredControls.length ? preferredControls : controls).sort((a, b) => {
         const ar = a.getBoundingClientRect();
         const br = b.getBoundingClientRect();
@@ -409,7 +415,7 @@ $prefix = @'
   "use strict";
 
   const INSTALL_KEY = "__bennettUiImprovementsBigPizza";
-  const VERSION = "1.0.5-bigpizza.1";
+  const VERSION = "1.0.6-bigpizza.1";
   const previous = window[INSTALL_KEY];
   if (previous && typeof previous.stop === "function") {
     try {
@@ -757,4 +763,6 @@ $suffix = @'
 $content = $prefix + $sourceText + $suffix
 Set-Content -LiteralPath $outPath -Value $content -NoNewline -Encoding utf8
 Write-Output $outPath
+
+
 
