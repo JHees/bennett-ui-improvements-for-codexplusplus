@@ -254,6 +254,27 @@ $sourceText = $sourceText.Replace(@'
       return rect.width > 0 && rect.width <= 56 && rect.height > 0 && rect.height <= 56 && text.length <= 32;
     };
 
+    const isUsageControlNode = (node) =>
+      node.closest?.('[data-codexpp="usage-slot"], [data-codexpp="usage-box"], [data-codexpp="usage-boxes"]');
+
+    const rowControls = (row) =>
+      Array.from(row.querySelectorAll('button, a, [role="button"]'))
+        .filter((control) =>
+          control instanceof HTMLElement &&
+          isVisibleElement(control) &&
+          !isUsageControlNode(control),
+        );
+
+    const isSlotAfterRightmostControl = (slot) => {
+      const row = slot.parentElement;
+      if (!(row instanceof HTMLElement)) return false;
+      const controls = rowControls(row);
+      if (!controls.length) return true;
+      const slotRect = slot.getBoundingClientRect();
+      const rightmostControl = Math.max(...controls.map((control) => control.getBoundingClientRect().right));
+      return slotRect.right >= rightmostControl - 2;
+    };
+
     const nearestControlRow = (sidebar, button) => {
       const sidebarRect = sidebar.getBoundingClientRect();
       let row = button.parentElement;
@@ -297,7 +318,12 @@ $sourceText = $sourceText.Replace(@'
       if (!sidebar) return null;
       for (const slot of sidebar.querySelectorAll('[data-codexpp="usage-slot"]')) {
         const row = slot.parentElement;
-        if (!(slot instanceof HTMLElement) || !(row instanceof HTMLElement) || !isNearSidebarBottom(sidebar, row)) {
+        if (
+          !(slot instanceof HTMLElement) ||
+          !(row instanceof HTMLElement) ||
+          !isNearSidebarBottom(sidebar, row) ||
+          !isSlotAfterRightmostControl(slot)
+        ) {
           slot.remove();
         }
       }
@@ -305,7 +331,8 @@ $sourceText = $sourceText.Replace(@'
         .find((slot) =>
           slot instanceof HTMLElement &&
           slot.parentElement instanceof HTMLElement &&
-          isNearSidebarBottom(sidebar, slot.parentElement),
+          isNearSidebarBottom(sidebar, slot.parentElement) &&
+          isSlotAfterRightmostControl(slot),
         );
       if (existingSlot instanceof HTMLElement) return existingSlot;
 
@@ -313,7 +340,8 @@ $sourceText = $sourceText.Replace(@'
         .filter((button) =>
           button instanceof HTMLElement &&
           isVisibleElement(button) &&
-          isNearSidebarBottom(sidebar, button),
+          isNearSidebarBottom(sidebar, button) &&
+          !isUsageControlNode(button),
         );
       const deviceControls = controls.filter(isDeviceButton);
       const settingsControls = controls.filter(isSettingsButton);
@@ -326,7 +354,7 @@ $sourceText = $sourceText.Replace(@'
       const ordered = (preferredControls.length ? preferredControls : controls).sort((a, b) => {
         const ar = a.getBoundingClientRect();
         const br = b.getBoundingClientRect();
-        return br.bottom - ar.bottom || br.right - ar.right;
+        return br.right - ar.right || br.bottom - ar.bottom;
       });
 
       for (const button of ordered) {
@@ -461,7 +489,7 @@ $prefix = @'
   "use strict";
 
   const INSTALL_KEY = "__bennettUiImprovementsBigPizza";
-  const VERSION = "1.0.7-bigpizza.1";
+  const VERSION = "1.0.8-bigpizza.1";
   const previous = window[INSTALL_KEY];
   if (previous && typeof previous.stop === "function") {
     try {

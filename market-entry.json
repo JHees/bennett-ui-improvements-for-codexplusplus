@@ -2,7 +2,7 @@
   "id": "bennett-ui-improvements",
   "name": "Bennett UI Improvements",
   "description": "将 b-nnett 版 Bennett UI Improvements 迁移为 BigPizzaV3 Codex++ renderer-only 用户脚本，保留隐藏升级提示、侧栏按钮网格、设置搜索、项目背景、斜杠菜单样式等 UI 增强。",
-  "version": "1.0.7-bigpizza.1",
+  "version": "1.0.8-bigpizza.1",
   "author": "bennett; JHees",
   "tags": [
     "codex",
@@ -13,5 +13,5 @@
   ],
   "homepage": "https://github.com/JHees/bennett-ui-improvements-for-codexplusplus",
   "script_url": "https://raw.githubusercontent.com/BigPizzaV3/CodexPlusPlusScriptMarket/main/scripts/bennett-ui-improvements.js",
-  "sha256": "9ebcfe3763ec0b46e0ba6ce0a3891ae8c46add85f065d8d89b6a870fe26ae46c"
+  "sha256": "20b439e067ffa8a16580c750b63478f4220dcafdfe6e490ed15c8d76753c7ae4"
 }
