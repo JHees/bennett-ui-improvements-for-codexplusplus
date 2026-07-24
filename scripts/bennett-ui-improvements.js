@@ -21,7 +21,7 @@
   "use strict";
 
   const INSTALL_KEY = "__bennettUiImprovementsBigPizza";
-  const VERSION = "1.0.9-bigpizza.1";
+  const VERSION = "1.0.12-bigpizza.1";
   const previous = window[INSTALL_KEY];
   if (previous && typeof previous.stop === "function") {
     try {
@@ -1163,27 +1163,29 @@ const FEATURES = {
 
     const hasBottomControl = (sidebar) => {
       const sidebarRect = sidebar.getBoundingClientRect();
-      const controls = Array.from(sidebar.querySelectorAll('button, a, [role="button"]'));
+      const controls = Array.from(sidebar.querySelectorAll('button, a, [role="button"], [role="status"], [aria-live], span, div'));
       return controls.some((control) => {
         if (!(control instanceof HTMLElement) || !isVisibleElement(control)) return false;
         const rect = control.getBoundingClientRect();
         const text = quickControlText(control);
         const nearBottom = rect.bottom >= sidebarRect.bottom - 260;
         const compact = rect.width > 0 && rect.width <= 64 && rect.height > 0 && rect.height <= 64;
-        return nearBottom && (compact || /\bmobile\b|\bphone\b|\bdevice\b|\bsettings?\b|手机|移动|设备|连接|设置/.test(text));
+        const downloadStatus = text.length <= 80 && /\bdownloading\b|\bdownload\b|\bupdating\b|\binstalling\b|正在下载|下载中|更新中|正在更新|安装中/.test(text);
+        return nearBottom && (compact || downloadStatus || /\bmobile\b|\bphone\b|\bdevice\b|\bsettings?\b|手机|移动|设备|连接|设置/.test(text));
       });
     };
 
     const addSidebarAncestorsForBottomControls = (candidates) => {
       const viewportHeight = window.innerHeight || document.documentElement.clientHeight || 0;
-      const controls = Array.from(document.querySelectorAll('button, a, [role="button"]'));
+      const controls = Array.from(document.querySelectorAll('button, a, [role="button"], [role="status"], [aria-live], span, div'));
       for (const control of controls) {
         if (!(control instanceof HTMLElement) || !isVisibleElement(control)) continue;
         const rect = control.getBoundingClientRect();
         if (rect.left > 560 || rect.bottom < viewportHeight - 280) continue;
         const text = quickControlText(control);
         const compact = rect.width > 0 && rect.width <= 64 && rect.height > 0 && rect.height <= 64;
-        if (!compact && !/\bmobile\b|\bphone\b|\bdevice\b|\bsettings?\b|手机|移动|设备|连接|设置/.test(text)) continue;
+        const downloadStatus = text.length <= 80 && /\bdownloading\b|\bdownload\b|\bupdating\b|\binstalling\b|正在下载|下载中|更新中|正在更新|安装中/.test(text);
+        if (!compact && !downloadStatus && !/\bmobile\b|\bphone\b|\bdevice\b|\bsettings?\b|手机|移动|设备|连接|设置/.test(text)) continue;
         let node = control.parentElement;
         while (node && node !== document.body) {
           if (isSidebarGeometry(node) && !looksLikeSettingsSidebar(node)) candidates.add(node);
@@ -1245,6 +1247,12 @@ const FEATURES = {
       return text.length <= 28 && /\bmobile\b|\bphone\b|\bdevice\b|手机|移动|设备|连接/.test(text);
     };
 
+    const isDownloadStatusNode = (node) => {
+      const text = controlText(node);
+      if (!text || text.length > 80) return false;
+      return /\bdownloading\b|\bdownload\b|\bupdating\b|\binstalling\b|正在下载|下载中|更新中|正在更新|安装中/.test(text);
+    };
+
     const isSettingsButton = (button) => {
       const text = controlText(button);
       return /\bsettings?\b|preferences?|设置|偏好/.test(text);
@@ -1255,7 +1263,15 @@ const FEATURES = {
       const sidebarRect = sidebar.getBoundingClientRect();
       const rect = node.getBoundingClientRect();
       const bottomBand = Math.min(Math.max(sidebarRect.height * 0.22, 120), 240);
-      return rect.bottom >= sidebarRect.bottom - bottomBand;
+      const visibleBottom = Math.min(
+        sidebarRect.bottom,
+        window.innerHeight || document.documentElement.clientHeight || sidebarRect.bottom,
+      );
+      return (
+        rect.top < visibleBottom &&
+        rect.bottom <= visibleBottom + 8 &&
+        rect.bottom >= visibleBottom - bottomBand
+      );
     };
 
     const isCompactIconControl = (control) => {
@@ -1309,6 +1325,29 @@ const FEATURES = {
       return null;
     };
 
+    const nearestBottomStatusRow = (sidebar, node) => {
+      const sidebarRect = sidebar.getBoundingClientRect();
+      let row = node.parentElement;
+      while (row && row !== document.body && row !== sidebar.parentElement) {
+        if (!(row instanceof HTMLElement)) break;
+        const rect = row.getBoundingClientRect();
+        const style = window.getComputedStyle(row);
+        const insideSidebar =
+          rect.left >= sidebarRect.left - 8 &&
+          rect.right <= sidebarRect.right + 8;
+        const nearBottom = isNearSidebarBottom(sidebar, row);
+        const compactStatusLayer =
+          insideSidebar &&
+          nearBottom &&
+          rect.height > 0 &&
+          rect.height <= 96 &&
+          (style.display === "flex" || style.display === "grid" || isDownloadStatusNode(row));
+        if (compactStatusLayer) return row;
+        row = row.parentElement;
+      }
+      return null;
+    };
+
     const createInlineSlot = (row, anchor) => {
       const existing = row.querySelector(':scope > [data-codexpp="usage-slot"]');
       if (existing instanceof HTMLElement) return existing;
@@ -1351,6 +1390,7 @@ const FEATURES = {
           button instanceof HTMLElement &&
           isVisibleElement(button) &&
           isNearSidebarBottom(sidebar, button) &&
+          !button.closest("section") &&
           !isUsageControlNode(button),
         );
       const deviceControls = controls.filter(isDeviceButton);
@@ -1370,6 +1410,27 @@ const FEATURES = {
       for (const button of ordered) {
         const row = nearestControlRow(sidebar, button);
         if (row) return createInlineSlot(row, button);
+      }
+
+      const statusAnchors = Array.from(
+        sidebar.querySelectorAll('[role="status"], [aria-live], [aria-label], [title], span, div'),
+      )
+        .filter((node) =>
+          node instanceof HTMLElement &&
+          isVisibleElement(node) &&
+          isNearSidebarBottom(sidebar, node) &&
+          !isUsageControlNode(node) &&
+          isDownloadStatusNode(node),
+        )
+        .sort((a, b) => {
+          const ar = a.getBoundingClientRect();
+          const br = b.getBoundingClientRect();
+          return br.bottom - ar.bottom || br.right - ar.right;
+        });
+
+      for (const anchor of statusAnchors) {
+        const row = nearestBottomStatusRow(sidebar, anchor);
+        if (row) return createInlineSlot(row, anchor);
       }
 
       return null;
@@ -5923,8 +5984,9 @@ const FEATURES = {
   /**
    * Add subtle grouped backgrounds behind project rows in the main sidebar.
    *
-   * Codex's sidebar project rows are `div[role="listitem"]` nodes with
-   * class `group/cwd` and an aria-label matching the child folder button.
+   * Codex's sidebar project rows can be either the legacy
+   * `div[role="listitem"].group/cwd` wrapper or the current
+   * `[data-app-action-sidebar-project-row][role="button"]` node.
    * We mark that row directly, then color the folder icon/title and any
    * unread indicator with the row's project theme.
    *
@@ -6054,12 +6116,34 @@ const FEATURES = {
       }
 
       .electron-dark [${ATTR}="row"] {
+        background-color: color-mix(
+          in srgb,
+          var(--codexpp-project-tint, var(--color-token-text-secondary)) 3%,
+          transparent
+        ) !important;
         box-shadow:
           inset 0 0 0 1px color-mix(
             in srgb,
-            var(--codexpp-project-text-color, var(--codexpp-project-tint, var(--color-token-text-secondary))) 22%,
+            var(--codexpp-project-text-color, var(--codexpp-project-tint, var(--color-token-text-secondary))) 13%,
             transparent
           ) !important;
+      }
+
+      .electron-dark [${ATTR}="row"]:hover {
+        background-color: color-mix(
+          in srgb,
+          var(--codexpp-project-tint, var(--color-token-text-secondary)) 6%,
+          transparent
+        ) !important;
+      }
+
+      .electron-dark [${ATTR}="icon"],
+      .electron-dark [${ATTR}="title"] {
+        color: color-mix(
+          in srgb,
+          var(--codexpp-project-text-color, var(--codexpp-project-tint, currentColor)) 58%,
+          var(--color-token-text-primary, white)
+        ) !important;
       }
 
       [${ATTR}="row"][style*="--codexpp-project-blue-token-override"] {
@@ -6180,7 +6264,8 @@ const FEATURES = {
 
     const labelFor = (node) =>
       normalize(
-        node.getAttribute("aria-label") ||
+        node.getAttribute("data-app-action-sidebar-project-label") ||
+          node.getAttribute("aria-label") ||
           node.getAttribute("title") ||
           node.textContent ||
           "",
@@ -6189,6 +6274,10 @@ const FEATURES = {
     const isProjectRow = (node) => {
       if (!(node instanceof HTMLElement)) return false;
       if (!visible(node)) return false;
+      if (node.matches("[data-app-action-sidebar-project-row][role='button']")) {
+        const text = labelFor(node);
+        return Boolean(text && text.length >= 2 && text.length <= 80 && !EXCLUDED_LABELS.has(text));
+      }
       if (node.getAttribute("role") !== "listitem") return false;
       if (!node.classList.contains("group/cwd")) return false;
 
@@ -6201,7 +6290,9 @@ const FEATURES = {
     };
 
     const candidateRows = (sidebar) =>
-      Array.from(sidebar.querySelectorAll("div[role='listitem'][aria-label]"))
+      Array.from(sidebar.querySelectorAll(
+        "[data-app-action-sidebar-project-row][role='button'], div[role='listitem'][aria-label]",
+      ))
         .filter(isProjectRow)
         .filter((node, index, rows) => rows.indexOf(node) === index);
 
@@ -6295,14 +6386,22 @@ const FEATURES = {
     };
 
     const isExpandedProject = (row) => {
+      if (row.matches("[data-app-action-sidebar-project-row]")) {
+        return row.getAttribute("aria-expanded") === "true" ||
+          row.getAttribute("data-app-action-sidebar-project-collapsed") === "false";
+      }
       if (row.getBoundingClientRect().height > 40) return true;
       return Boolean(row.querySelector('[role="list"][aria-label]'));
     };
 
     const markProjectParts = (row, label) => {
-      const header = Array.from(row.querySelectorAll("[role='button'][aria-label]"))
-        .find((node) => node instanceof HTMLElement && labelFor(node) === label);
-      const target = header instanceof HTMLElement ? header : row.querySelector("[role='button'][aria-label]");
+      const header = row.matches("[data-app-action-sidebar-project-row][role='button']")
+        ? row
+        : Array.from(row.querySelectorAll("[role='button'][aria-label]"))
+          .find((node) => node instanceof HTMLElement && labelFor(node) === label);
+      const target = header instanceof HTMLElement
+        ? header
+        : row.querySelector("[role='button'][aria-label]");
       if (!(target instanceof HTMLElement)) return;
 
       target.querySelectorAll("svg").forEach((node) => {
@@ -6333,7 +6432,9 @@ const FEATURES = {
     };
 
     const projectPathForRow = (row) => {
-      const action = row?.querySelector?.("[data-app-action-sidebar-project-id]");
+      const action = row?.matches?.("[data-app-action-sidebar-project-id]")
+        ? row
+        : row?.querySelector?.("[data-app-action-sidebar-project-id]");
       const value = action instanceof HTMLElement
         ? action.getAttribute("data-app-action-sidebar-project-id")
         : null;
@@ -6383,7 +6484,9 @@ const FEATURES = {
     const onProjectOverflowTrigger = (event) => {
       const button = event.target?.closest?.("button, [role='button']");
       if (!(button instanceof HTMLElement)) return;
-      const row = button.closest("div[role='listitem'][aria-label]");
+      const row = button.closest(
+        "[data-app-action-sidebar-project-row], div[role='listitem'][aria-label]",
+      );
       if (!isProjectRow(row)) return;
       const label = labelFor(row);
       if (!isProjectOverflowButton(row, label, button)) return;
@@ -6391,7 +6494,9 @@ const FEATURES = {
     };
 
     const onProjectContextMenu = (event) => {
-      const row = event.target?.closest?.("div[role='listitem'][aria-label]");
+      const row = event.target?.closest?.(
+        "[data-app-action-sidebar-project-row], div[role='listitem'][aria-label]",
+      );
       if (!isProjectRow(row)) return;
       seedProjectMenu(labelFor(row), event, row, row);
     };
@@ -8141,4 +8246,3 @@ function switchControl(initial, onChange) {
     };
   }
 })();
-
