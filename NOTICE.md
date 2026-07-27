@@ -24,3 +24,7 @@ migration is kept under `old-bennett-ui/` so the provenance is visible.
 The migration work adapts storage, settings, lifecycle, and DOM mounting logic
 for the BigPizzaV3 Codex++ renderer-only user-script runtime. It does not claim
 original authorship of the Bennett UI implementation.
+
+The Markdown preview math integration does not redistribute KaTeX. At runtime
+it reuses the KaTeX module and fonts already shipped with the installed Codex
+desktop application.

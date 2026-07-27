@@ -1,66 +1,66 @@
 # Bennett UI Improvements for BigPizzaV3 Codex++
 
-This repository contains a BigPizzaV3 Codex++ user-script migration of
-`b-nnett/codex-plusplus-bennett-ui`.
+Bennett UI Improvements is a BigPizzaV3 Codex++ user script for Markdown preview, sidebar, quota, and settings-page enhancements.
 
-The UI implementation is not original work by this repository owner. The
-original tweak was written by Bennett for the b-nnett Codex++ runtime. This
-repository adapts the renderer-side parts of that tweak to the BigPizzaV3
-Codex++ user-script environment.
+## Highlights
+
+- **Markdown math preview** renders formulas with Codex's built-in KaTeX in the right-side Markdown file preview. Formulas are embedded in the editor's text layout, move naturally with the document, and reveal their LaTeX source when selected.
+- **Project colors** add grouped backgrounds and color separation to sidebar projects for faster visual navigation.
+- **Quota display** keeps the 5-hour and weekly remaining quota in one compact sidebar control and switches values on click.
+
+## All features
+
+| Feature | Default | Description |
+| --- | --- | --- |
+| Markdown preview math | On | Renders `$...$`, `$$...$$`, `\(...\)`, and `\[...\]` in right-side `.md` and `.markdown` file previews using Codex's built-in KaTeX. Formulas are embedded in the editor's text layout and scrolling; selecting one reveals its LaTeX source. |
+| Project backgrounds and colors | On | Adds grouped backgrounds and color separation to sidebar projects. |
+| 5-hour / weekly quota | On | Shows remaining quota in the sidebar and switches between 5-hour and weekly values on click. API mode displays `API`. |
+| Sidebar action grid | On | Arranges New task, Search, Plugins, and Automations in a compact 2×2 grid. |
+| Hide upgrade prompts | On | Hides Upgrade and Get Plus prompts in the sidebar and top bar. |
+| Settings search | On | Adds a search field to Codex Settings. |
+| Matched settings sidebar width | On | Keeps the Settings sidebar aligned with the main sidebar width. |
+| Slash-menu polish | On | Refines row spacing, section labels, and selected states in the slash menu. |
+| Square sidebar corners | Off | Removes the inner rounded corners between the sidebar and main content. |
+| Multi-select sidebar chats | Off | Uses `Cmd/Ctrl + click` to select multiple sidebar chats and opens batch actions from the context menu. |
+
+Every feature can be toggled independently from `Codex++ Manager → Bennett UI Settings`.
 
 ## Install
 
-Copy the user script into the Codex++ user script directory:
+Copy the ready-to-install script:
 
 ```text
-%APPDATA%\Codex++\user_scripts\bennett-ui-improvements.js
+scripts\bennett-ui-improvements.js
 ```
 
-Then reload user scripts from Codex++.
-
-The ready-to-install file is:
+to the Codex++ user-script directory:
 
 ```text
-scripts/bennett-ui-improvements.js
+%APPDATA%\Codex++\user_scripts\
 ```
 
-## Features
+Enable the script in Codex++ Manager and reload user scripts.
 
-- Hide upgrade prompts.
-- Show a compact 5-hour / weekly quota control near the sidebar controls.
-- Detect API mode and show `API` instead of requesting official account usage.
-- Keep the quota control out of the Codex++ settings sidebar.
-- Square the sidebar/main-surface corner.
-- Add settings search.
-- Match settings sidebar width to the main sidebar.
-- Render sidebar actions in a compact grid.
-- Add project row backgrounds.
-- Polish the slash menu.
+## Console API
 
-Some original b-nnett features depended on main-process APIs or Electron IPC
-that BigPizzaV3 user scripts do not expose. Those features are disabled or
-degraded intentionally.
-
-## API Mode Behavior
-
-In official ChatGPT account mode, the usage control reads Codex usage signals
-and displays 5-hour / weekly remaining quota.
-
-In pure API or mixed API mode, the control displays `API` and does not call
-`/wham/usage` or parse stale quota UI.
+```js
+window.__bennettUiImprovementsBigPizza.setFeature("sidebar-action-grid", false);
+window.__bennettUiImprovementsBigPizza.setFeature("sidebar-action-grid", true);
+window.__bennettUiImprovementsBigPizza.setFeature("render-markdown-preview-math", true);
+window.__bennettMarkdownPreviewMath.getStats();
+```
 
 ## Build
-
-The migration can be regenerated from the vendored source snapshot:
 
 ```powershell
 .\tools\build-migrated-script.ps1
 ```
 
-The build script reads:
+The build reads:
 
 ```text
 old-bennett-ui/index.js
+features/markdown-preview-math.js
 ```
 
 and writes:
@@ -69,17 +69,12 @@ and writes:
 scripts/bennett-ui-improvements.js
 ```
 
-## Source And Attribution
+## Source
 
-- Original project: `https://github.com/b-nnett/codex-plusplus-bennett-ui`
-- Original author: Bennett
-- Original license: MIT
-- Migration target: `https://github.com/BigPizzaV3/CodexPlusPlus`
-- Script market target: `https://github.com/BigPizzaV3/CodexPlusPlusScriptMarket`
-
-See `NOTICE.md` for attribution details.
+- Bennett UI: `https://github.com/b-nnett/codex-plusplus-bennett-ui`
+- Codex++: `https://github.com/BigPizzaV3/CodexPlusPlus`
+- Codex++ Script Market: `https://github.com/BigPizzaV3/CodexPlusPlusScriptMarket`
 
 ## License
 
-The original project is MIT licensed. The migrated wrapper and compatibility
-changes are also provided under the MIT license. See `LICENSE`.
+MIT. See `LICENSE` and `NOTICE.md`.

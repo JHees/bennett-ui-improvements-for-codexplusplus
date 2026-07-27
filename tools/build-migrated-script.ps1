@@ -9,6 +9,7 @@ $sourcePath = Resolve-Path -LiteralPath $Source
 $outPath = Join-Path (Get-Location) $Out
 $outDir = Split-Path -Parent $outPath
 New-Item -ItemType Directory -Force -Path $outDir | Out-Null
+$previewMathFeaturePath = Resolve-Path -LiteralPath "features\markdown-preview-math.js"
 
 $sourceText = Get-Content -LiteralPath $sourcePath -Raw -Encoding utf8
 $sourceText = $sourceText -replace "\r\n", "`n"
@@ -16,6 +17,13 @@ $sourceText = $sourceText.Replace('"show-usage-in-sidebar": false', '"show-usage
 $sourceText = $sourceText.Replace('"show-message-metrics-on-hover": true', '"show-message-metrics-on-hover": false')
 $sourceText = $sourceText.Replace('"sidebar-chat-multi-select": true', '"sidebar-chat-multi-select": false')
 $sourceText = $sourceText.Replace('"show-pinned-chat-project-names": true', '"show-pinned-chat-project-names": false')
+$sourceText = $sourceText.Replace(
+  '"sidebar-project-backgrounds": true',
+  '"sidebar-project-backgrounds": true,' + "`n" + '        "render-markdown-preview-math": true'
+)
+$previewMathFeature = Get-Content -LiteralPath $previewMathFeaturePath -Raw -Encoding utf8
+$previewMathFeature = $previewMathFeature -replace "\r\n", "`n"
+$sourceText = $sourceText.Replace("const FEATURES = {", "const FEATURES = {`n$previewMathFeature")
 $sourceText = $sourceText.Replace('let snapshot = readSnapshot(api);', 'let snapshot = null; // Do not render persisted quota data before this page fetches fresh usage.')
 $sourceText = [regex]::Replace($sourceText, '    const ASIDE_SELECTOR = \[[\s\S]*?    \]\.join\(", "\);\n', @'
     const ASIDE_SELECTOR = [
@@ -238,27 +246,29 @@ $sourceText = $sourceText.Replace(@'
 
     const hasBottomControl = (sidebar) => {
       const sidebarRect = sidebar.getBoundingClientRect();
-      const controls = Array.from(sidebar.querySelectorAll('button, a, [role="button"]'));
+      const controls = Array.from(sidebar.querySelectorAll('button, a, [role="button"], [role="status"], [aria-live], span, div'));
       return controls.some((control) => {
         if (!(control instanceof HTMLElement) || !isVisibleElement(control)) return false;
         const rect = control.getBoundingClientRect();
         const text = quickControlText(control);
         const nearBottom = rect.bottom >= sidebarRect.bottom - 260;
         const compact = rect.width > 0 && rect.width <= 64 && rect.height > 0 && rect.height <= 64;
-        return nearBottom && (compact || /\bmobile\b|\bphone\b|\bdevice\b|\bsettings?\b|手机|移动|设备|连接|设置/.test(text));
+        const downloadStatus = text.length <= 80 && /\bdownloading\b|\bdownload\b|\bupdating\b|\binstalling\b|正在下载|下载中|更新中|正在更新|安装中/.test(text);
+        return nearBottom && (compact || downloadStatus || /\bmobile\b|\bphone\b|\bdevice\b|\bsettings?\b|手机|移动|设备|连接|设置/.test(text));
       });
     };
 
     const addSidebarAncestorsForBottomControls = (candidates) => {
       const viewportHeight = window.innerHeight || document.documentElement.clientHeight || 0;
-      const controls = Array.from(document.querySelectorAll('button, a, [role="button"]'));
+      const controls = Array.from(document.querySelectorAll('button, a, [role="button"], [role="status"], [aria-live], span, div'));
       for (const control of controls) {
         if (!(control instanceof HTMLElement) || !isVisibleElement(control)) continue;
         const rect = control.getBoundingClientRect();
         if (rect.left > 560 || rect.bottom < viewportHeight - 280) continue;
         const text = quickControlText(control);
         const compact = rect.width > 0 && rect.width <= 64 && rect.height > 0 && rect.height <= 64;
-        if (!compact && !/\bmobile\b|\bphone\b|\bdevice\b|\bsettings?\b|手机|移动|设备|连接|设置/.test(text)) continue;
+        const downloadStatus = text.length <= 80 && /\bdownloading\b|\bdownload\b|\bupdating\b|\binstalling\b|正在下载|下载中|更新中|正在更新|安装中/.test(text);
+        if (!compact && !downloadStatus && !/\bmobile\b|\bphone\b|\bdevice\b|\bsettings?\b|手机|移动|设备|连接|设置/.test(text)) continue;
         let node = control.parentElement;
         while (node && node !== document.body) {
           if (isSidebarGeometry(node) && !looksLikeSettingsSidebar(node)) candidates.add(node);
@@ -325,6 +335,12 @@ $sourceText = $sourceText.Replace(@'
       return text.length <= 28 && /\bmobile\b|\bphone\b|\bdevice\b|手机|移动|设备|连接/.test(text);
     };
 
+    const isDownloadStatusNode = (node) => {
+      const text = controlText(node);
+      if (!text || text.length > 80) return false;
+      return /\bdownloading\b|\bdownload\b|\bupdating\b|\binstalling\b|正在下载|下载中|更新中|正在更新|安装中/.test(text);
+    };
+
     const isSettingsButton = (button) => {
       const text = controlText(button);
       return /\bsettings?\b|preferences?|设置|偏好/.test(text);
@@ -384,6 +400,29 @@ $sourceText = $sourceText.Replace(@'
           rect.height <= 88 &&
           (style.display === "flex" || style.display === "grid" || buttonCount >= 2);
         if (looksLikeControlLayer) return row;
+        row = row.parentElement;
+      }
+      return null;
+    };
+
+    const nearestBottomStatusRow = (sidebar, node) => {
+      const sidebarRect = sidebar.getBoundingClientRect();
+      let row = node.parentElement;
+      while (row && row !== document.body && row !== sidebar.parentElement) {
+        if (!(row instanceof HTMLElement)) break;
+        const rect = row.getBoundingClientRect();
+        const style = window.getComputedStyle(row);
+        const insideSidebar =
+          rect.left >= sidebarRect.left - 8 &&
+          rect.right <= sidebarRect.right + 8;
+        const nearBottom = isNearSidebarBottom(sidebar, row);
+        const compactStatusLayer =
+          insideSidebar &&
+          nearBottom &&
+          rect.height > 0 &&
+          rect.height <= 96 &&
+          (style.display === "flex" || style.display === "grid" || isDownloadStatusNode(row));
+        if (compactStatusLayer) return row;
         row = row.parentElement;
       }
       return null;
@@ -450,6 +489,27 @@ $sourceText = $sourceText.Replace(@'
       for (const button of ordered) {
         const row = nearestControlRow(sidebar, button);
         if (row) return createInlineSlot(row, button);
+      }
+
+      const statusAnchors = Array.from(
+        sidebar.querySelectorAll('[role="status"], [aria-live], [aria-label], [title], span, div'),
+      )
+        .filter((node) =>
+          node instanceof HTMLElement &&
+          isVisibleElement(node) &&
+          isNearSidebarBottom(sidebar, node) &&
+          !isUsageControlNode(node) &&
+          isDownloadStatusNode(node),
+        )
+        .sort((a, b) => {
+          const ar = a.getBoundingClientRect();
+          const br = b.getBoundingClientRect();
+          return br.bottom - ar.bottom || br.right - ar.right;
+        });
+
+      for (const anchor of statusAnchors) {
+        const row = nearestBottomStatusRow(sidebar, anchor);
+        if (row) return createInlineSlot(row, anchor);
       }
 
       return null;
@@ -579,7 +639,7 @@ $prefix = @'
   "use strict";
 
   const INSTALL_KEY = "__bennettUiImprovementsBigPizza";
-  const VERSION = "1.0.9-bigpizza.1";
+  const VERSION = "1.0.13-bigpizza.1";
   const previous = window[INSTALL_KEY];
   if (previous && typeof previous.stop === "function") {
     try {
@@ -611,6 +671,7 @@ $suffix = @'
     "match-sidebar-width",
     "sidebar-action-grid",
     "sidebar-project-backgrounds",
+    "render-markdown-preview-math",
     "slash-menu-polish",
     "show-message-metrics-on-hover",
     "sidebar-chat-multi-select",
@@ -665,6 +726,13 @@ $suffix = @'
       detail: "为项目行增加分组背景，并保留旧的项目颜色偏好。",
       defaultEnabled: true,
       status: "可用",
+    },
+    {
+      id: "render-markdown-preview-math",
+      title: "Markdown 预览数学公式",
+      detail: "在右侧 .md 文件预览中使用 Codex 内置 KaTeX 渲染 LaTeX，并以内嵌组件参与文本排版和滚动。选中公式时显示源码。",
+      defaultEnabled: true,
+      status: "支持 $…$、$$…$$、\\(…\\) 和 \\[…\\]",
     },
     {
       id: "slash-menu-polish",
