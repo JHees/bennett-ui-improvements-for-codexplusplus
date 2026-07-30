@@ -70,6 +70,7 @@ module.exports = {
         "sidebar-chat-multi-select": true,
         "show-pinned-chat-project-names": true,
         "slash-menu-polish": true,
+        "cross-account-history-refresh": true,
       },
     };
     this._state = state;
@@ -194,6 +195,12 @@ function renderSettings(root, state) {
       title: "Slash menu polish",
       description:
         "Tighten the composer slash menu with denser rows, clearer active state, and calmer section headers.",
+    },
+    {
+      id: "cross-account-history-refresh",
+      title: "Cross-account history refresh",
+      description:
+        "Refresh cloud conversation history after account changes. This requires the active provider to support account-scoped thread listing.",
     },
   ];
 
@@ -344,6 +351,142 @@ function deactivateFeature(state, id) {
 // ─────────────────────────────────────────────────────────────── features ──
 
 const FEATURES = {
+  /**
+   * Force Codex's recent-conversation cache to refresh after authentication
+   * changes. This is renderer-only so it can be used without rebuilding the
+   * Codex++ Rust launcher.
+   */
+  "cross-account-history-refresh"(api) {
+    const PATCH_VERSION = "2";
+    const clients = new Map();
+    let disposed = false;
+    let refreshTimer = null;
+    let scanTimer = null;
+    let modulePromise = null;
+    let initialRefreshScheduled = false;
+    let lastRefreshAt = 0;
+
+    const findAsset = (part) =>
+      Array.from(performance.getEntriesByType("resource"))
+        .map((entry) => entry.name)
+        .find((url) => {
+          const cleanUrl = String(url || "").split("?")[0];
+          return cleanUrl.includes("/assets/") && cleanUrl.includes(part) && cleanUrl.endsWith(".js");
+        }) || "";
+
+    const loadSignals = async () => {
+      if (!modulePromise) {
+        modulePromise = Promise.resolve().then(async () => {
+          const url = findAsset("app-initial-") || findAsset("app-server-manager-signals-");
+          if (!url) throw new Error("Codex history bridge asset not found");
+          return await import(url);
+        }).catch((error) => {
+          modulePromise = null;
+          throw error;
+        });
+      }
+      return await modulePromise;
+    };
+
+    const findRefreshBridge = (module) => {
+      if (typeof module?.ddt === "function") return module.ddt;
+      if (typeof module?.rn === "function") return module.rn;
+      return Object.values(module || {}).find((value) =>
+        typeof value === "function" && /sendRequest/.test(String(value)) && value.length >= 2,
+      );
+    };
+
+    const refresh = async (hostId = "local") => {
+      const signals = await loadSignals();
+      const bridge = findRefreshBridge(signals);
+      if (typeof bridge !== "function") throw new Error("Codex history bridge export not found");
+      lastRefreshAt = Date.now();
+      await bridge("refresh-recent-conversations-for-host", {
+        hostId: hostId || "local",
+        mode: "expanded",
+        sortKey: "updated_at",
+      });
+    };
+
+    const schedule = (hostId = "local") => {
+      if (disposed) return;
+      if (refreshTimer) clearTimeout(refreshTimer);
+      refreshTimer = setTimeout(() => {
+        refreshTimer = null;
+        void refresh(hostId).catch((error) => api.log.debug("history refresh failed", error));
+      }, 1200);
+    };
+
+    const patchClient = (client) => {
+      if (!client || typeof client.addNotificationCallback !== "function") return;
+      if (client.__bennettCrossAccountHistoryRefresh === PATCH_VERSION) return;
+      try {
+        const cleanup = client.addNotificationCallback(
+          ["account/login/completed", "account/updated"],
+          (notification) => {
+            if (notification?.method === "account/login/completed" && notification.params?.success === false) return;
+            schedule(client.getHostId?.() || client.hostId || "local");
+          },
+        );
+        clients.set(client, typeof cleanup === "function" ? cleanup : null);
+        client.__bennettCrossAccountHistoryRefresh = PATCH_VERSION;
+      } catch (error) {
+        api.log.debug("history notification hook unavailable", error);
+      }
+    };
+
+    const scan = async () => {
+      if (disposed) return;
+      try {
+        const signals = await loadSignals();
+        for (const value of Object.values(signals || {})) {
+          patchClient(value);
+          if (value && typeof value.get === "function") {
+            try {
+              patchClient(value.get());
+            } catch {
+            }
+          }
+        }
+        if (!initialRefreshScheduled) {
+          initialRefreshScheduled = true;
+          schedule("local");
+        }
+      } catch (error) {
+        api.log.debug("history refresh hook pending", error);
+      }
+    };
+
+    const onWindowWake = () => schedule("local");
+    window.addEventListener("focus", onWindowWake);
+    window.addEventListener("online", onWindowWake);
+    document.addEventListener("visibilitychange", onWindowWake);
+    void scan();
+    scanTimer = setInterval(() => {
+      void scan();
+      if (Date.now() - lastRefreshAt > 10000) schedule("local");
+    }, 5000);
+
+    return () => {
+      disposed = true;
+      if (refreshTimer) clearTimeout(refreshTimer);
+      if (scanTimer) clearInterval(scanTimer);
+      window.removeEventListener("focus", onWindowWake);
+      window.removeEventListener("online", onWindowWake);
+      document.removeEventListener("visibilitychange", onWindowWake);
+      for (const [client, cleanup] of clients) {
+        try {
+          cleanup?.();
+        } catch {
+        }
+        if (client.__bennettCrossAccountHistoryRefresh === PATCH_VERSION) {
+          delete client.__bennettCrossAccountHistoryRefresh;
+        }
+      }
+      clients.clear();
+    };
+  },
+
   /**
    * Hide the "Upgrade" / "Get Plus" buttons. We match by visible text
    * across the document, skipping anything inside Codex's settings shell

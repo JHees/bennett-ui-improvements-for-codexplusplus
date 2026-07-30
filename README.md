@@ -4,7 +4,7 @@ Bennett UI Improvements is a BigPizzaV3 Codex++ user script for Markdown preview
 
 ## Highlights
 
-- **Markdown math preview** renders formulas with Codex's built-in KaTeX in the right-side Markdown file preview. Formulas are embedded in the editor's text layout, move naturally with the document, and reveal their LaTeX source when selected.
+- **Markdown math preview** renders formulas and math tables with Codex's built-in KaTeX in the right-side Markdown file preview. Formulas and individual table cells can be edited in place without changing the surrounding layout.
 - **Project colors** add grouped backgrounds and color separation to sidebar projects for faster visual navigation.
 - **Quota display** keeps the 5-hour and weekly remaining quota in one compact sidebar control and switches values on click.
 
@@ -12,7 +12,8 @@ Bennett UI Improvements is a BigPizzaV3 Codex++ user script for Markdown preview
 
 | Feature | Default | Description |
 | --- | --- | --- |
-| Markdown preview math | On | Renders `$...$`, `$$...$$`, `\(...\)`, and `\[...\]` in right-side `.md` and `.markdown` file previews using Codex's built-in KaTeX. Formulas are embedded in the editor's text layout and scrolling; selecting one reveals its LaTeX source. |
+| Markdown preview math | On | Renders `$...$`, `$$...$$`, `\(...\)`, and `\[...\]` in right-side `.md` and `.markdown` file previews using Codex's built-in KaTeX. Formulas and math-table cells remain in the document layout and support in-place source editing. |
+| Cross-account history refresh | On | Refreshes the cloud conversation list after login or account switching. |
 | Project backgrounds and colors | On | Adds grouped backgrounds and color separation to sidebar projects. |
 | 5-hour / weekly quota | On | Shows remaining quota in the sidebar and switches between 5-hour and weekly values on click. API mode displays `API`. |
 | Sidebar action grid | On | Arranges New task, Search, Plugins, and Automations in a compact 2×2 grid. |

@@ -639,7 +639,7 @@ $prefix = @'
   "use strict";
 
   const INSTALL_KEY = "__bennettUiImprovementsBigPizza";
-  const VERSION = "1.0.17-bigpizza.1";
+  const VERSION = "1.0.19-bigpizza.1";
   const previous = window[INSTALL_KEY];
   if (previous && typeof previous.stop === "function") {
     try {
@@ -673,6 +673,7 @@ $suffix = @'
     "sidebar-project-backgrounds",
     "render-markdown-preview-math",
     "slash-menu-polish",
+    "cross-account-history-refresh",
     "show-message-metrics-on-hover",
     "sidebar-chat-multi-select",
     "show-pinned-chat-project-names",
@@ -730,7 +731,7 @@ $suffix = @'
     {
       id: "render-markdown-preview-math",
       title: "Markdown 预览数学公式",
-      detail: "在右侧 .md 文件预览中使用 Codex 内置 KaTeX 渲染 LaTeX，并以内嵌组件参与文本排版和滚动。选中公式时显示源码。",
+      detail: "在右侧 .md 文件预览中使用 Codex 内置 KaTeX 渲染 LaTeX；公式和数学表格保持原位排版，点击可编辑公式或单个表格单元格。",
       defaultEnabled: true,
       status: "支持 $…$、$$…$$、\\(…\\) 和 \\[…\\]",
     },
@@ -738,6 +739,13 @@ $suffix = @'
       id: "slash-menu-polish",
       title: "斜杠菜单优化",
       detail: "压缩斜杠菜单行距，并强化选中状态。",
+      defaultEnabled: true,
+      status: "可用",
+    },
+    {
+      id: "cross-account-history-refresh",
+      title: "跨账号会话刷新",
+      detail: "登录或切换账号后刷新云端会话列表。",
       defaultEnabled: true,
       status: "可用",
     },
