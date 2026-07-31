@@ -351,7 +351,15 @@ $sourceText = $sourceText.Replace(@'
       const sidebarRect = sidebar.getBoundingClientRect();
       const rect = node.getBoundingClientRect();
       const bottomBand = Math.min(Math.max(sidebarRect.height * 0.22, 120), 240);
-      return rect.bottom >= sidebarRect.bottom - bottomBand;
+      const visibleBottom = Math.min(
+        sidebarRect.bottom,
+        window.innerHeight || document.documentElement.clientHeight || sidebarRect.bottom,
+      );
+      return (
+        rect.top < visibleBottom &&
+        rect.bottom <= visibleBottom + 8 &&
+        rect.bottom >= visibleBottom - bottomBand
+      );
     };
 
     const isCompactIconControl = (control) => {
@@ -470,6 +478,7 @@ $sourceText = $sourceText.Replace(@'
           button instanceof HTMLElement &&
           isVisibleElement(button) &&
           isNearSidebarBottom(sidebar, button) &&
+          !button.closest("section") &&
           !isUsageControlNode(button),
         );
       const deviceControls = controls.filter(isDeviceButton);
@@ -520,6 +529,7 @@ $sourceText = $sourceText.Replace(@'
         ? {
             fiveHour: { label: "API", pct: null, resetAt: null, apiMode: true },
             weekly: null,
+            points: null,
             at: Date.now(),
             apiMode: true,
           }
@@ -529,6 +539,7 @@ $sourceText = $sourceText.Replace(@'
         : {
             fiveHour: { label: "5h", pct: null, resetAt: null },
             weekly: { label: "Weekly", pct: null, resetAt: null },
+            points: null,
             at: 0,
           };
 
@@ -555,10 +566,19 @@ $sourceText = $sourceText.Replace(@'
 $sourceText = $sourceText.Replace('        if (!directUsageAvailable) {', '        if (accountMode === "official" && !directUsageAvailable) {')
 $sourceText = $sourceText.Replace(@'
   /** Pull the entry for `kind` out of the live snapshot. */
-  const entryFor = (snap, k) => (k === "5h" ? snap.fiveHour : snap.weekly);
+  const entryFor = (snap, k) => {
+    if (k === "5h") return snap.fiveHour;
+    if (k === "weekly") return snap.weekly;
+    return snap.points;
+  };
+  const isApiSnapshot = (snap) => !!snap?.apiMode || snap?.fiveHour?.apiMode;
 '@, @'
   /** Pull the entry for `kind` out of the live snapshot. */
-  const entryFor = (snap, k) => (k === "5h" ? snap.fiveHour : snap.weekly);
+  const entryFor = (snap, k) => {
+    if (k === "5h") return snap.fiveHour;
+    if (k === "weekly") return snap.weekly;
+    return snap.points;
+  };
   const isApiSnapshot = (snap) => !!snap?.apiMode || snap?.fiveHour?.apiMode;
 '@)
 $sourceText = $sourceText.Replace(@'
@@ -639,7 +659,7 @@ $prefix = @'
   "use strict";
 
   const INSTALL_KEY = "__bennettUiImprovementsBigPizza";
-  const VERSION = "1.0.19-bigpizza.1";
+  const VERSION = "1.0.23-bigpizza.1";
   const previous = window[INSTALL_KEY];
   if (previous && typeof previous.stop === "function") {
     try {
@@ -677,6 +697,7 @@ $suffix = @'
     "show-message-metrics-on-hover",
     "sidebar-chat-multi-select",
     "show-pinned-chat-project-names",
+    "hide-usage-alert",
   ];
   const featureInfo = [
     {
@@ -688,10 +709,17 @@ $suffix = @'
     },
     {
       id: "show-usage-in-sidebar",
-      title: "5 小时 / 周额度",
-      detail: "优先通过 Codex renderer fetch bridge 读取 /wham/usage，失败时再解析页面里的额度 UI。点击可在 5h 和 Weekly 之间切换。",
+      title: "5 小时 / 周 / Credit 额度",
+      detail: "优先通过 Codex renderer fetch bridge 读取 /wham/usage；默认显示 5h，点击可切换 Weekly；只有实际收到点数数据时才显示 Credit，API 模式显示 API。",
       defaultEnabled: true,
       status: "当前页面暴露额度信号时可用",
+    },
+    {
+      id: "hide-usage-alert",
+      title: "隐藏额度耗尽提示",
+      detail: "隐藏额度用完后的弹窗、重置提示和额度卡片。",
+      defaultEnabled: true,
+      status: "可用",
     },
     {
       id: "square-sidebar",
@@ -730,8 +758,8 @@ $suffix = @'
     },
     {
       id: "render-markdown-preview-math",
-      title: "Markdown 预览数学公式",
-      detail: "在右侧 .md 文件预览中使用 Codex 内置 KaTeX 渲染 LaTeX；公式和数学表格保持原位排版，点击可编辑公式或单个表格单元格。",
+      title: "Markdown 预览增强",
+      detail: "在右侧 .md 文件预览中渲染 LaTeX、数学表格和图片；相对图片路径以当前文档为基准，点击内容可原位编辑源码。",
       defaultEnabled: true,
       status: "支持 $…$、$$…$$、\\(…\\) 和 \\[…\\]",
     },
@@ -1003,6 +1031,3 @@ $suffix = @'
 $content = $prefix + $sourceText + $suffix
 Set-Content -LiteralPath $outPath -Value $content -NoNewline -Encoding utf8
 Write-Output $outPath
-
-
-
