@@ -1,4 +1,4 @@
-﻿param(
+param(
   [string]$Source = "old-bennett-ui\index.js",
   [string]$Out = "scripts\bennett-ui-improvements.js"
 )
@@ -659,7 +659,7 @@ $prefix = @'
   "use strict";
 
   const INSTALL_KEY = "__bennettUiImprovementsBigPizza";
-  const VERSION = "1.0.23-bigpizza.3";
+  const VERSION = "1.0.23-bigpizza.9";
   const previous = window[INSTALL_KEY];
   if (previous && typeof previous.stop === "function") {
     try {
@@ -703,7 +703,7 @@ $suffix = @'
     {
       id: "hide-upgrade-prompts",
       title: "隐藏升级提示",
-      detail: "隐藏侧栏和顶部栏中的 Upgrade / Get Plus 提示。",
+      detail: "隐藏 Plus/Pro 套餐升级提示，但保留 Codex 软件更新提示。",
       defaultEnabled: true,
       status: "可用",
     },

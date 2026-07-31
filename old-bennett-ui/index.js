@@ -1,4 +1,4 @@
-/**
+﻿/**
  * Bennett's UI Improvements
  *
  * A bag of small, individually-toggleable UI tweaks for Codex. Settings
@@ -135,7 +135,7 @@ function renderSettings(root, state) {
       id: "hide-upgrade-prompts",
       title: "Hide upgrade prompts",
       description:
-        'Hide the "Upgrade" pill in the app sidebar and the "Get Plus" button in the top bar.',
+        'Hide the Plus/Pro plan upgrade pill and Get Plus button, but keep Codex software-update notices visible.',
     },
     {
       id: "show-usage-in-sidebar",
@@ -492,7 +492,7 @@ const FEATURES = {
   },
 
   /**
-   * Hide the "Upgrade" / "Get Plus" buttons. We match by visible text
+   * Hide the Plus/Pro plan "Upgrade" / "Get Plus" buttons while keeping Codex software-update notices visible. We match by visible text
    * across the document, skipping anything inside Codex's settings shell
    * or our own injected panels. Hidden via inline `display:none` so we
    * can restore it cleanly on dispose.
@@ -511,6 +511,8 @@ const FEATURES = {
       "upgrade to plus",
     ]);
     const CONTAINS = ["upgrade for higher limits"];
+    const APP_UPDATE_CONTEXT_RE =
+      /(?:\b(?:app|application|desktop|codex)\s+(?:update|upgrade|version|release)\b|\b(?:update|updated|updating|new version|latest version|release|download|restart|install)\b|软件升级|应用升级|版本升级|新版本|软件更新|应用更新|更新可用|下载更新|重启更新|安装包)/i;
     const hidden = new Set(/* HTMLElement */);
 
     const isInsideOurShell = (el) => {
@@ -522,18 +524,43 @@ const FEATURES = {
       return false;
     };
 
-    // Codex sometimes splits the label across icon + text spans, so we use
-    // textContent and collapse whitespace.
+    // Codex may split a label across icon + text spans, so use textContent
+    // for the button itself and semantic attributes for update banners.
     const normText = (el) =>
       (el.textContent || "").replace(/\s+/g, " ").trim().toLowerCase();
+    const semanticText = (el) =>
+      [
+        el.textContent,
+        el.getAttribute("aria-label"),
+        el.getAttribute("title"),
+        el.getAttribute("data-testid"),
+        el.getAttribute("data-test"),
+        el.id,
+        typeof el.className === "string" ? el.className : "",
+      ]
+        .filter(Boolean)
+        .join(" ")
+        .replace(/\s+/g, " ")
+        .trim()
+        .toLowerCase();
 
-    const matches = (text) => {
-      if (!text) return false;
+    const isAppUpdateControl = (el) => {
+      let n = el;
+      for (let depth = 0; n && depth < 5; depth += 1, n = n.parentElement) {
+        const text = semanticText(n);
+        // Avoid matching against the entire document body, which could contain
+        // an unrelated update message elsewhere in the page.
+        if (text.length <= 240 && APP_UPDATE_CONTEXT_RE.test(text)) return true;
+      }
+      return false;
+    };
+
+    const matches = (el, text) => {
+      if (!text || isAppUpdateControl(el)) return false;
       if (EXACT.has(text)) return true;
       for (const c of CONTAINS) if (text.includes(c)) return true;
       return false;
     };
-
     const scan = () => {
       const candidates = document.querySelectorAll(
         'button, a, [role="button"], [role="menuitem"]',
@@ -543,7 +570,7 @@ const FEATURES = {
         if (isInsideOurShell(el)) continue;
         const t = normText(el);
         if (t.length === 0 || t.length > 80) continue;
-        if (!matches(t)) continue;
+        if (!matches(el, t)) continue;
         const host = el.closest('[class*="rounded"], [class*="badge"]') || el;
         if (!(host instanceof HTMLElement)) continue;
         host.dataset.codexppPrevDisplay = host.style.display || "";
