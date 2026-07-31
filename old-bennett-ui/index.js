@@ -71,6 +71,7 @@ module.exports = {
         "show-pinned-chat-project-names": true,
         "slash-menu-polish": true,
         "cross-account-history-refresh": true,
+        "hide-usage-alert": true,
       },
     };
     this._state = state;
@@ -201,6 +202,12 @@ function renderSettings(root, state) {
       title: "Cross-account history refresh",
       description:
         "Refresh cloud conversation history after account changes. This requires the active provider to support account-scoped thread listing.",
+    },
+    {
+      id: "hide-usage-alert",
+      title: "Hide usage exhaustion alerts",
+      description:
+        "Hide Codex usage exhaustion banners and reset prompts.",
     },
   ];
 
@@ -357,14 +364,13 @@ const FEATURES = {
    * Codex++ Rust launcher.
    */
   "cross-account-history-refresh"(api) {
-    const PATCH_VERSION = "2";
+    const PATCH_VERSION = "3";
     const clients = new Map();
     let disposed = false;
     let refreshTimer = null;
     let scanTimer = null;
     let modulePromise = null;
     let initialRefreshScheduled = false;
-    let lastRefreshAt = 0;
 
     const findAsset = (part) =>
       Array.from(performance.getEntriesByType("resource"))
@@ -400,7 +406,6 @@ const FEATURES = {
       const signals = await loadSignals();
       const bridge = findRefreshBridge(signals);
       if (typeof bridge !== "function") throw new Error("Codex history bridge export not found");
-      lastRefreshAt = Date.now();
       await bridge("refresh-recent-conversations-for-host", {
         hostId: hostId || "local",
         mode: "expanded",
@@ -464,7 +469,6 @@ const FEATURES = {
     void scan();
     scanTimer = setInterval(() => {
       void scan();
-      if (Date.now() - lastRefreshAt > 10000) schedule("local");
     }, 5000);
 
     return () => {
@@ -566,9 +570,10 @@ const FEATURES = {
   },
 
   /**
-   * Surface 5h + Weekly rate limits in the sidebar slot where the "Upgrade"
-   * pill lives. Sources its data from Codex's authenticated app-server usage
-   * endpoint, with Codex's rendered rate-limit UI as a fallback.
+   * Surface 5h + Weekly rate limits and points balance in the sidebar slot
+   * where the "Upgrade" pill lives. Sources its data from Codex's
+   * authenticated app-server usage endpoint, with Codex's rendered
+   * rate-limit UI as a fallback.
    *
    * Strategy
    * --------
@@ -583,6 +588,7 @@ const FEATURES = {
      * Persisted snapshot:
      *   { fiveHour:{label,pct,resetAt} | null,
      *     weekly:  {label,pct,resetAt} | null,
+     *     points:   {label,value} | null,
      *     at:number }
      * `pct` is REMAINING (Codex displays remaining %, e.g. "100%").
      * `resetAt` is whatever Codex shows verbatim (typically "HH:MM",
@@ -623,15 +629,25 @@ const FEATURES = {
     };
 
     const applySnapshot = (partial, source) => {
-      if (!partial?.fiveHour && !partial?.weekly) return false;
+      if (
+        !partial?.fiveHour &&
+        !partial?.weekly &&
+        !Object.prototype.hasOwnProperty.call(partial || {}, "points")
+      ) {
+        return false;
+      }
       const next = {
         fiveHour: partial.fiveHour || snapshot?.fiveHour || null,
         weekly: partial.weekly || snapshot?.weekly || null,
+        points: Object.prototype.hasOwnProperty.call(partial, "points")
+          ? partial.points
+          : snapshot?.points || null,
         at: Date.now(),
       };
       const changed =
         JSON.stringify(next.fiveHour) !== JSON.stringify(snapshot?.fiveHour) ||
-        JSON.stringify(next.weekly) !== JSON.stringify(snapshot?.weekly);
+        JSON.stringify(next.weekly) !== JSON.stringify(snapshot?.weekly) ||
+        JSON.stringify(next.points) !== JSON.stringify(snapshot?.points);
       snapshot = next;
       writeSnapshot(api, snapshot);
       if (changed) {
@@ -835,6 +851,47 @@ const FEATURES = {
       };
     };
 
+    const pointValue = (value) => {
+      if (value == null) return null;
+      if (typeof value === "string" || typeof value === "number") {
+        const text = String(value).trim();
+        return text || null;
+      }
+      if (typeof value !== "object") return null;
+      if (value.unlimited === true) return "无限";
+      for (const key of [
+        "balance",
+        "remaining",
+        "available",
+        "amount",
+        "points",
+        "credits",
+        "value",
+      ]) {
+        const result = pointValue(value[key]);
+        if (result != null) return result;
+      }
+      return null;
+    };
+
+    const normalizePoints = (status) => {
+      if (!status || typeof status !== "object") return null;
+      const candidates = [
+        status.points,
+        status.point_balance,
+        status.pointBalance,
+        status.credits,
+        status.credit,
+        status.account?.points,
+        status.account?.credits,
+      ];
+      for (const candidate of candidates) {
+        const value = pointValue(candidate);
+        if (value != null) return { label: "Credit", value, kind: "points" };
+      }
+      return null;
+    };
+
     const pickClosestWindow = (windows, targetMinutes, predicate) => {
       let best = null;
       let bestDistance = Infinity;
@@ -884,6 +941,7 @@ const FEATURES = {
       return {
         fiveHour: normalizeUsageWindow(five, "5h"),
         weekly: normalizeUsageWindow(weekly, "Weekly"),
+        points: normalizePoints(status),
       };
     };
 
@@ -928,9 +986,11 @@ const FEATURES = {
     const applyUsageEvent = (message) => {
       if (!message || typeof message !== "object") return false;
       const windows = collectUsageWindows(message);
-      if (!windows.length) return false;
+      const points = normalizePoints(message);
+      if (!windows.length && !points) return false;
       const partial = snapshotFromUsageWindows(windows);
-      if (!partial.fiveHour && !partial.weekly) return false;
+      if (points) partial.points = points;
+      if (!partial.fiveHour && !partial.weekly && !partial.points) return false;
       directUsageAvailable = true;
       applySnapshot(partial, "rate-limit-event");
       return true;
@@ -1237,6 +1297,71 @@ const FEATURES = {
       for (const slot of document.querySelectorAll('[data-codexpp="usage-slot"]')) {
         if (slot instanceof HTMLElement && slot.children.length === 0) slot.remove();
       }
+    };
+  },
+
+  /** Hide exhaustion banners and reset prompts without touching conversation content. */
+  "hide-usage-alert"() {
+    const STYLE_ID = "codex-plus-hide-usage-alert-style";
+    const HIDDEN_ATTR = "data-codex-plus-hidden-usage-alert";
+    const quotaRe = /(Codex\s*消息限额已用尽|消息限额已用尽|message\s+limit|usage\s+limit|out\s+of\s+Codex\s+messages|额度|限额|quota|rate\s+limit)/i;
+    const resetRe = /(额度将于|继续使用\s*Codex|升级至\s*Plus|quota\s+will\s+reset|limit\s+will\s+reset|rate\s+limit\s+resets|reset|重置|upgrade\s+to\s+plus)/i;
+    const usageCardRe = /(剩余\s*\d+%\s*使用量|remaining\s+\d+%\s+usage|usage\s+remaining|reset\s+frequency|next\s+reset)/i;
+    const actionRe = /(升级|Plus|upgrade|pricing|重置|reset|限额|额度|限制|limit|quota)/i;
+    const hidden = new Set();
+    let observer = null;
+    let timer = 0;
+
+    const textOf = (node) => String(node?.innerText || node?.textContent || "").replace(/\s+/g, " ").trim();
+    const visibleBox = (node) => {
+      if (!(node instanceof HTMLElement)) return false;
+      const rect = node.getBoundingClientRect();
+      return rect.width >= 160 && rect.height >= 16 && rect.bottom > 0 && rect.top < (window.innerHeight || 900);
+    };
+    const hasAction = (node, text) => actionRe.test(`${text} ${Array.from(node.querySelectorAll("button, a, [role='button']")).slice(0, 8).map((item) => textOf(item)).join(" ")}`);
+    const hasEditable = (node) => Boolean(node.querySelector("input, textarea, [contenteditable='true'], [role='textbox']"));
+    const touchesUsageControl = (node) => Boolean(node.closest("[data-codexpp='usage-slot'], [data-codexpp='usage-box'], [data-codexpp='usage-boxes']"));
+    const shouldHide = (node) => {
+      if (!(node instanceof HTMLElement) || node.closest("[data-message-author-role], article")) return false;
+      if (!node.matches("[role='alert'], [role='status'], [aria-live]")) return false;
+      if (!visibleBox(node)) return false;
+      if (hasEditable(node) || touchesUsageControl(node)) return false;
+      const text = textOf(node);
+      if (text.length < 12 || text.length > 500) return false;
+      const rect = node.getBoundingClientRect();
+      const bannerLike = rect.width >= 300 && rect.height >= 30 && rect.height <= 240 && quotaRe.test(text) && resetRe.test(text);
+      const cardLike = rect.width >= 160 && rect.width <= 560 && rect.height >= 70 && rect.height <= 340 && usageCardRe.test(text) && hasAction(node, text);
+      return (bannerLike || cardLike) && hasAction(node, text);
+    };
+    const hide = (node) => {
+      if (!(node instanceof HTMLElement) || node === document.body || node === document.documentElement) return;
+      node.setAttribute(HIDDEN_ATTR, "true");
+      hidden.add(node);
+    };
+    const scan = () => {
+      timer = 0;
+      if (!document.body) return;
+      for (const node of document.body.querySelectorAll('[role="alert"], [role="status"], [aria-live]')) {
+        if (!node.hasAttribute(HIDDEN_ATTR) && shouldHide(node)) hide(node);
+      }
+    };
+    const schedule = () => {
+      if (!timer) timer = window.setTimeout(scan, 80);
+    };
+    const style = document.createElement("style");
+    style.id = STYLE_ID;
+    style.textContent = `[${HIDDEN_ATTR}="true"] { display: none !important; visibility: hidden !important; pointer-events: none !important; }`;
+    document.documentElement.appendChild(style);
+    observer = new MutationObserver(schedule);
+    observer.observe(document.documentElement, { childList: true, subtree: true, characterData: true });
+    scan();
+
+    return () => {
+      if (timer) window.clearTimeout(timer);
+      observer?.disconnect();
+      for (const node of hidden) node.removeAttribute(HIDDEN_ATTR);
+      style.remove();
+      hidden.clear();
     };
   },
 
@@ -7336,8 +7461,8 @@ function writeSnapshot(api, snap) {
 }
 
 /**
- * Render a single rotating usage box. Click toggles between 5h and Weekly;
- * hover replaces the content with "Resets: HH:MM" for 5h or
+ * Render a single rotating usage box. Click toggles between 5h, Weekly, and points;
+ * hover replaces the content with "Resets: HH:MM" for 5h or a points value for
  * "Resets: Wed, HH:MM" for weekly. The currently-selected kind is persisted
  * to storage so it survives reloads.
  *
@@ -7345,9 +7470,22 @@ function writeSnapshot(api, snap) {
  * values in place without unmount/remount.
  */
 function renderUsageBox(api, snapshot) {
-  const ORDER = ["5h", "weekly"]; // toggle order
+  const BASE_ORDER = ["5h", "weekly"];
+  let order = [...BASE_ORDER];
   let kind = api.storage.get("usage:visible-kind", "5h");
-  if (!ORDER.includes(kind)) kind = "5h";
+  const syncOrder = (snap) => {
+    const hasPoints = !!(
+      snap?.points &&
+      snap.points.value != null &&
+      String(snap.points.value).trim() !== ""
+    );
+    order = hasPoints ? [...BASE_ORDER, "points"] : BASE_ORDER;
+    if (!order.includes(kind)) {
+      kind = "5h";
+      api.storage.set("usage:visible-kind", kind);
+    }
+  };
+  syncOrder(snapshot);
 
   const btn = document.createElement("button");
   btn.type = "button";
@@ -7382,7 +7520,11 @@ function renderUsageBox(api, snapshot) {
   };
 
   /** Pull the entry for `kind` out of the live snapshot. */
-  const entryFor = (snap, k) => (k === "5h" ? snap.fiveHour : snap.weekly);
+  const entryFor = (snap, k) => {
+    if (k === "5h") return snap.fiveHour;
+    if (k === "weekly") return snap.weekly;
+    return snap.points;
+  };
 
   /** Apply colors + text for the *value* state (i.e. not hover). */
   const applyValueState = (snap) => {
@@ -7396,16 +7538,31 @@ function renderUsageBox(api, snapshot) {
     btn.classList.toggle("bg-token-foreground/5", !lowEnergy);
     btn.classList.toggle("text-token-text-primary", !lowEnergy);
 
-    setText(left, entry?.label || (kind === "5h" ? "5h" : "Weekly"));
+    setText(
+      left,
+      entry?.label || (kind === "5h" ? "5h" : kind === "weekly" ? "Weekly" : "Credit"),
+    );
 
     const pctEl = singleRightSpan();
-    setText(pctEl, remaining == null ? "—" : `${remaining}%`);
+    setText(
+      pctEl,
+      kind === "points"
+        ? entry?.value || "—"
+        : remaining == null
+          ? "—"
+          : `${remaining}%`,
+    );
     setClass(pctEl, lowEnergy ? "font-medium" : "text-token-text-secondary");
   };
 
   /** Replace the entire box content with the reset label. */
   const applyHoverState = (snap) => {
     const entry = entryFor(snap, kind);
+    if (kind === "points") {
+      // Credit is a stable balance value; hovering it must not replace the label.
+      applyValueState(snap);
+      return;
+    }
     setText(left, "Resets:");
     setClass(left, "truncate text-token-text-secondary");
     const t = singleRightSpan();
@@ -7432,8 +7589,8 @@ function renderUsageBox(api, snapshot) {
   btn.addEventListener("click", (e) => {
     e.preventDefault();
     e.stopPropagation();
-    const i = ORDER.indexOf(kind);
-    kind = ORDER[(i + 1) % ORDER.length];
+    const i = order.indexOf(kind);
+    kind = order[(i + 1) % order.length];
     api.storage.set("usage:visible-kind", kind);
     // Per the design: clicking shows the OTHER kind's value, even if the
     // cursor is still over the box.
@@ -7450,6 +7607,7 @@ function renderUsageBox(api, snapshot) {
   btn._refresh = (next) => {
     if (next === currentSnap) return;
     currentSnap = next;
+    syncOrder(next);
     if (btn.matches(":hover") && !suppressHover) applyHoverState(currentSnap);
     else applyValueState(currentSnap);
   };

@@ -659,7 +659,7 @@ $prefix = @'
   "use strict";
 
   const INSTALL_KEY = "__bennettUiImprovementsBigPizza";
-  const VERSION = "1.0.23-bigpizza.2";
+  const VERSION = "1.0.23-bigpizza.3";
   const previous = window[INSTALL_KEY];
   if (previous && typeof previous.stop === "function") {
     try {
@@ -1029,5 +1029,6 @@ $suffix = @'
 '@
 
 $content = $prefix + $sourceText + $suffix
+$content = [regex]::Replace($content, "`n{4,}(?=  const tweak = module\.exports;)", "`n`n")
 Set-Content -LiteralPath $outPath -Value $content -NoNewline -Encoding utf8
 Write-Output $outPath

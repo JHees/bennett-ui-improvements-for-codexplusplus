@@ -12,8 +12,12 @@
     const CELL_ATTR = "data-bennett-markdown-preview-math-cell";
     const EDITOR_ATTR = "data-bennett-markdown-preview-math-editor";
     const EDITING_ATTR = "data-bennett-markdown-preview-math-editing";
+    const IMAGE_ATTR = "data-bennett-markdown-preview-image";
+    const IMAGE_STATUS_ATTR = "data-bennett-markdown-preview-image-status";
+    const IMAGE_MAX_BYTES = 20 * 1024 * 1024;
     const MARKDOWN_EXTENSION = /\.(?:md|markdown|mdown|mkd)$/i;
     const states = new Map();
+    const imageCache = new Map();
     let disposed = false;
     let scanFrame = 0;
     let scanning = false;
@@ -21,6 +25,7 @@
     let katexPromise = null;
     let mainModuleUrl = null;
     let lastError = null;
+    let imageRequestSequence = 0;
 
     const style = document.createElement("style");
     style.id = STYLE_ID;
@@ -60,6 +65,11 @@
       }
       [${FORMULA_ATTR}] {
         cursor: text;
+      }
+      [${FORMULA_ATTR}][${EDITING_ATTR}] {
+        width: 100%;
+        min-width: 0;
+        overflow: visible;
       }
       [${TABLE_ATTR}] {
         display: block;
@@ -132,9 +142,48 @@
         max-width: 100%;
       }
       textarea[${EDITOR_ATTR}] {
-        min-height: 3.2em;
+        min-height: 4.5em;
+        overflow-x: hidden;
+        overflow-y: hidden;
         resize: vertical;
-        white-space: pre;
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+      }
+      [${IMAGE_ATTR}] {
+        display: inline-block;
+        box-sizing: border-box;
+        max-width: 100%;
+        vertical-align: middle;
+        cursor: text;
+      }
+      [${IMAGE_ATTR}="block"] {
+        display: block;
+        width: 100%;
+        margin: 0.5em 0;
+      }
+      [${IMAGE_ATTR}] img {
+        display: block;
+        max-width: 100%;
+        height: auto;
+        border-radius: var(--radius-md, 0.375rem);
+      }
+      [${IMAGE_ATTR}="inline"] img {
+        max-height: 12em;
+      }
+      [${IMAGE_STATUS_ATTR}] {
+        display: inline-flex;
+        min-height: 2em;
+        max-width: 100%;
+        align-items: center;
+        padding: 0.35em 0.6em;
+        border: 1px solid var(
+          --color-token-border-default,
+          color-mix(in srgb, currentColor 12%, transparent)
+        );
+        border-radius: var(--radius-md, 0.375rem);
+        color: var(--color-token-text-secondary, currentColor);
+        font-size: 0.875em;
+        overflow-wrap: anywhere;
       }
     `;
     document.head.appendChild(style);
@@ -263,6 +312,296 @@
         i = close + closer.length - 1;
       }
       return formulas;
+    }
+
+    function dispatchDesktopViewMessage(message) {
+      let forwarded = false;
+      const bridge = window.electronBridge;
+      if (typeof bridge?.sendMessageFromView === "function") {
+        forwarded = true;
+        bridge.sendMessageFromView(message).catch(() => {});
+      }
+      const event = new CustomEvent("codex-message-from-view", {
+        detail: message,
+      });
+      if (forwarded) event.__codexForwardedViaBridge = true;
+      window.dispatchEvent(event);
+    }
+
+    function requestDesktopJson(command, params, timeoutMs = 15_000) {
+      const requestSequence = ++imageRequestSequence;
+      const randomSuffix =
+        typeof window.crypto?.randomUUID === "function"
+          ? window.crypto.randomUUID()
+          : typeof window.crypto?.getRandomValues === "function"
+            ? Array.from(window.crypto.getRandomValues(new Uint32Array(4)), (value) => value.toString(16)).join("-")
+            : `${Date.now()}-${requestSequence}-${Math.random().toString(36).slice(2)}`;
+      const requestId = `bennett-preview-${randomSuffix}`;
+      return new Promise((resolve, reject) => {
+        let finished = false;
+        const cleanup = () => {
+          if (finished) return;
+          finished = true;
+          window.removeEventListener("message", onMessage);
+          window.clearTimeout(timer);
+        };
+        const finish = (callback, value) => {
+          if (finished) return;
+          cleanup();
+          callback(value);
+        };
+        const onMessage = (event) => {
+          if (event.source !== window) return;
+          const data = event.data;
+          if (
+            !data ||
+            typeof data !== "object" ||
+            data.type !== "fetch-response" ||
+            data.requestId !== requestId
+          ) {
+            return;
+          }
+          if (data.responseType !== "success") {
+            finish(reject, new Error(data.error || `${command} failed`));
+            return;
+          }
+          try {
+            const body = JSON.parse(data.bodyJsonString);
+            if (data.status >= 200 && data.status < 300) {
+              finish(resolve, body);
+            } else {
+              finish(reject, new Error(`HTTP ${data.status}`));
+            }
+          } catch (error) {
+            finish(reject, error);
+          }
+        };
+        const timer = window.setTimeout(() => {
+          dispatchDesktopViewMessage({ type: "cancel-fetch", requestId });
+          finish(reject, new Error(`${command} timed out`));
+        }, timeoutMs);
+        window.addEventListener("message", onMessage);
+        dispatchDesktopViewMessage({
+          type: "fetch",
+          requestId,
+          method: "POST",
+          url: `vscode://codex/${command}`,
+          headers: {
+            "content-type": "application/json",
+          },
+          body: JSON.stringify(params),
+        });
+      });
+    }
+
+    function parseImageTarget(inner) {
+      const value = inner.trim();
+      if (!value) return null;
+      if (value.startsWith("<")) {
+        const close = value.indexOf(">");
+        if (close <= 1) return null;
+        const target = value.slice(1, close).trim();
+        const remainder = value.slice(close + 1).trim();
+        const title = remainder.match(/^(?:"([^"]*)"|'([^']*)'|\(([^)]*)\))$/);
+        return {
+          target,
+          title: title ? title[1] ?? title[2] ?? title[3] ?? "" : "",
+        };
+      }
+      const titled = value.match(
+        /^(.*?)(?:\s+(?:"([^"]*)"|'([^']*)'|\(([^)]*)\)))\s*$/,
+      );
+      if (!titled) return { target: value, title: "" };
+      return {
+        target: titled[1].trim(),
+        title: titled[2] ?? titled[3] ?? titled[4] ?? "",
+      };
+    }
+
+    function parseMarkdownImages(text) {
+      const masked = maskCode(text);
+      const images = [];
+      for (let start = 0; start < masked.length - 4; start += 1) {
+        if (
+          masked[start] !== "!" ||
+          masked[start + 1] !== "[" ||
+          escapedAt(masked, start)
+        ) {
+          continue;
+        }
+
+        let bracketDepth = 1;
+        let bracketClose = -1;
+        for (let index = start + 2; index < masked.length; index += 1) {
+          if (escapedAt(masked, index)) continue;
+          if (masked[index] === "[") bracketDepth += 1;
+          if (masked[index] === "]") {
+            bracketDepth -= 1;
+            if (!bracketDepth) {
+              bracketClose = index;
+              break;
+            }
+          }
+          if (masked[index] === "\n" || masked[index] === "\r") break;
+        }
+        if (bracketClose < 0 || masked[bracketClose + 1] !== "(") continue;
+
+        let parenthesisDepth = 1;
+        let quote = null;
+        let parenthesisClose = -1;
+        for (let index = bracketClose + 2; index < masked.length; index += 1) {
+          const character = masked[index];
+          if (escapedAt(masked, index)) continue;
+          if (quote) {
+            if (character === quote) quote = null;
+            continue;
+          }
+          if (character === '"' || character === "'") {
+            quote = character;
+            continue;
+          }
+          if (character === "(") parenthesisDepth += 1;
+          if (character === ")") {
+            parenthesisDepth -= 1;
+            if (!parenthesisDepth) {
+              parenthesisClose = index;
+              break;
+            }
+          }
+          if (character === "\n" || character === "\r") break;
+        }
+        if (parenthesisClose < 0) continue;
+
+        const parsed = parseImageTarget(
+          text.slice(bracketClose + 2, parenthesisClose),
+        );
+        if (!parsed?.target) continue;
+        images.push({
+          start,
+          end: parenthesisClose + 1,
+          alt: text.slice(start + 2, bracketClose),
+          target: parsed.target,
+          title: parsed.title,
+          source: text.slice(start, parenthesisClose + 1),
+        });
+        start = parenthesisClose;
+      }
+      return images;
+    }
+
+    function normalizeFilePath(path, separator) {
+      let value = path;
+      let prefix = "";
+      if (/^[A-Za-z]:[\\/]/.test(value)) {
+        prefix = `${value.slice(0, 2)}${separator}`;
+        value = value.slice(3);
+      } else if (/^[\\/]{2}/.test(value)) {
+        prefix = separator.repeat(2);
+        value = value.replace(/^[\\/]+/, "");
+      } else if (/^[\\/]/.test(value)) {
+        prefix = separator;
+        value = value.replace(/^[\\/]+/, "");
+      }
+      const parts = [];
+      for (const part of value.split(/[\\/]+/)) {
+        if (!part || part === ".") continue;
+        if (part === "..") {
+          if (parts.length && parts[parts.length - 1] !== "..") parts.pop();
+          else if (!prefix) parts.push(part);
+          continue;
+        }
+        parts.push(part);
+      }
+      return `${prefix}${parts.join(separator)}`;
+    }
+
+    function resolveImageTarget(target, filePath) {
+      let reference = target.trim();
+      if (!reference) return null;
+      if (/^(?:data|blob):/i.test(reference)) return reference;
+      if (/^https?:\/\//i.test(reference)) return reference;
+      if (/^file:\/\//i.test(reference)) {
+        try {
+          const url = new URL(reference);
+          reference = decodeURIComponent(url.pathname);
+          if (/^\/[A-Za-z]:\//.test(reference)) reference = reference.slice(1);
+        } catch {
+          return null;
+        }
+      } else {
+        try {
+          reference = decodeURIComponent(reference);
+        } catch {
+          // Keep the literal Markdown destination.
+        }
+      }
+
+      const windowsPath = /^[A-Za-z]:[\\/]/.test(filePath)
+        || filePath.includes("\\");
+      const separator = windowsPath ? "\\" : "/";
+      if (
+        /^[A-Za-z]:[\\/]/.test(reference) ||
+        /^[\\/]{2}/.test(reference) ||
+        (!windowsPath && reference.startsWith("/"))
+      ) {
+        return normalizeFilePath(reference, separator);
+      }
+      const lastSlash = Math.max(
+        filePath.lastIndexOf("/"),
+        filePath.lastIndexOf("\\"),
+      );
+      const directory = lastSlash >= 0 ? filePath.slice(0, lastSlash) : "";
+      return normalizeFilePath(
+        directory ? `${directory}${separator}${reference}` : reference,
+        separator,
+      );
+    }
+
+    function imageMimeType(target, provided) {
+      if (typeof provided === "string" && provided.startsWith("image/")) {
+        return provided;
+      }
+      const extension = target.split(/[?#]/)[0].match(/\.([A-Za-z0-9]+)$/)?.[1]?.toLowerCase();
+      return {
+        png: "image/png",
+        jpg: "image/jpeg",
+        jpeg: "image/jpeg",
+        gif: "image/gif",
+        webp: "image/webp",
+        svg: "image/svg+xml",
+        bmp: "image/bmp",
+        ico: "image/x-icon",
+        avif: "image/avif",
+      }[extension] || null;
+    }
+
+    function loadImageSource(target, filePath, hostId) {
+      const resolved = resolveImageTarget(target, filePath);
+      if (!resolved) return Promise.reject(new Error("图片路径为空"));
+      if (/^(?:data|https?):/i.test(resolved)) return Promise.resolve(resolved);
+      const key = `${hostId || "local"}\n${resolved}`;
+      let pending = imageCache.get(key);
+      if (pending) return pending;
+      pending = requestDesktopJson("read-file-binary", {
+        hostId: hostId || "local",
+        path: resolved,
+        maxBytes: IMAGE_MAX_BYTES,
+      }, 20_000)
+        .then((result) => {
+          if (!result?.contentsBase64) {
+            if (/^https?:\/\//i.test(resolved)) return resolved;
+            throw new Error("图片不存在、格式不受支持或超过 20 MB");
+          }
+          const mimeType = imageMimeType(resolved, result.mimeType);
+          if (!mimeType) throw new Error("文件不是支持的图片格式");
+          return `data:${mimeType};base64,${result.contentsBase64}`;
+        })
+        .catch((error) => {
+          imageCache.delete(key);
+          throw error;
+        });
+      imageCache.set(key, pending);
+      return pending;
     }
 
     function currentMainModuleUrl() {
@@ -525,6 +864,17 @@
       return { from: formula.start, to: formula.end, block: false };
     }
 
+    function imageRange(image, state) {
+      const firstLine = state.doc.lineAt(image.start);
+      const lastLine = state.doc.lineAt(Math.max(image.start, image.end - 1));
+      const before = state.sliceDoc(firstLine.from, image.start);
+      const after = state.sliceDoc(image.end, lastLine.to);
+      if (!before.trim() && !after.trim()) {
+        return { from: firstLine.from, to: lastLine.to, block: true };
+      }
+      return { from: image.start, to: image.end, block: false };
+    }
+
     function splitTableRow(lineText, lineFrom = 0) {
       let contentFrom = 0;
       let contentTo = lineText.length;
@@ -740,7 +1090,7 @@
             event?.preventDefault();
             event?.stopPropagation();
 
-            const multiline = this.block || /[\r\n]/.test(this.source);
+            const multiline = this.display || this.block || /[\r\n]/.test(this.source);
             const editor = ownerDocument.createElement(multiline ? "textarea" : "input");
             if (!multiline) editor.type = "text";
             editor.value = this.source;
@@ -750,6 +1100,12 @@
             element.setAttribute(EDITING_ATTR, "");
             element.replaceChildren(editor);
 
+            const resizeEditor = () => {
+              if (!(editor instanceof HTMLTextAreaElement)) return;
+              editor.style.height = "auto";
+              editor.style.height = `${Math.max(editor.scrollHeight, 72)}px`;
+              view.requestMeasure?.();
+            };
             let finished = false;
             const finish = (commit) => {
               if (finished) return;
@@ -774,6 +1130,7 @@
             editor.addEventListener("mousedown", (inputEvent) => {
               inputEvent.stopPropagation();
             });
+            editor.addEventListener("input", resizeEditor);
             editor.addEventListener("keydown", (inputEvent) => {
               if (inputEvent.key === "Escape") {
                 inputEvent.preventDefault();
@@ -790,6 +1147,7 @@
             });
             editor.addEventListener("blur", () => finish(true), { once: true });
             ownerDocument.defaultView?.setTimeout(() => {
+              resizeEditor();
               editor.focus();
               editor.select();
             }, 0);
@@ -799,6 +1157,204 @@
             if (event.key === "Enter" || event.key === " ") beginEdit(event);
           });
           renderFormula();
+          return element;
+        }
+      };
+    }
+
+    function createImageWidgetClass(context) {
+      return class ImageWidget {
+        constructor(image, range) {
+          this.alt = image.alt;
+          this.target = image.target;
+          this.title = image.title;
+          this.source = image.source;
+          this.editFrom = image.start;
+          this.editTo = image.end;
+          this.block = range.block;
+          this.filePath = context.filePath;
+          this.hostId = context.hostId;
+        }
+
+        eq(other) {
+          return (
+            other instanceof this.constructor &&
+            other.alt === this.alt &&
+            other.target === this.target &&
+            other.title === this.title &&
+            other.source === this.source &&
+            other.editFrom === this.editFrom &&
+            other.editTo === this.editTo &&
+            other.block === this.block &&
+            other.filePath === this.filePath &&
+            other.hostId === this.hostId
+          );
+        }
+
+        updateDOM() {
+          return false;
+        }
+
+        compare(other) {
+          return this === other || (
+            this.constructor === other?.constructor &&
+            this.eq(other)
+          );
+        }
+
+        get estimatedHeight() {
+          return this.block ? 240 : -1;
+        }
+
+        get lineBreaks() {
+          return 0;
+        }
+
+        ignoreEvent() {
+          return true;
+        }
+
+        coordsAt() {
+          return null;
+        }
+
+        get isHidden() {
+          return false;
+        }
+
+        get editable() {
+          return false;
+        }
+
+        destroy(dom) {
+          if (dom) dom.__bennettImageActive = false;
+        }
+
+        toDOM(view) {
+          const ownerDocument = view.dom.ownerDocument;
+          const element = ownerDocument.createElement(this.block ? "div" : "span");
+          element.__bennettImageActive = true;
+          element.setAttribute(IMAGE_ATTR, this.block ? "block" : "inline");
+          element.setAttribute("contenteditable", "false");
+          element.setAttribute("role", "img");
+          element.setAttribute("aria-label", this.alt || this.title || this.target);
+          element.tabIndex = 0;
+          element.title = "单击编辑图片语法，Enter 提交，Esc 取消";
+
+          const renderStatus = (status, message) => {
+            element.removeAttribute(EDITING_ATTR);
+            const statusElement = ownerDocument.createElement("span");
+            statusElement.setAttribute(IMAGE_STATUS_ATTR, status);
+            statusElement.textContent = message;
+            element.replaceChildren(statusElement);
+            view.requestMeasure?.();
+          };
+
+          const renderImage = () => {
+            if (!element.__bennettImageActive) return;
+            renderStatus("loading", `正在加载图片：${this.alt || this.target}`);
+            loadImageSource(this.target, this.filePath, this.hostId)
+              .then((source) => {
+                if (
+                  !element.__bennettImageActive ||
+                  element.hasAttribute(EDITING_ATTR)
+                ) {
+                  return;
+                }
+                const image = ownerDocument.createElement("img");
+                image.alt = this.alt;
+                if (this.title) image.title = this.title;
+                image.addEventListener("load", () => view.requestMeasure?.(), {
+                  once: true,
+                });
+                image.addEventListener("error", () => {
+                  if (!element.__bennettImageActive) return;
+                  renderStatus(
+                    "error",
+                    `无法显示图片：${this.alt || this.target}`,
+                  );
+                }, { once: true });
+                image.src = source;
+                element.replaceChildren(image);
+                view.requestMeasure?.();
+              })
+              .catch((error) => {
+                if (
+                  !element.__bennettImageActive ||
+                  element.hasAttribute(EDITING_ATTR)
+                ) {
+                  return;
+                }
+                const detail = String(error?.message || error || "").trim();
+                renderStatus(
+                  "error",
+                  `无法加载图片：${this.alt || this.target}${detail ? `（${detail}）` : ""}`,
+                );
+              });
+          };
+
+          const beginEdit = (event) => {
+            if (event?.button != null && event.button !== 0) return;
+            if (element.hasAttribute(EDITING_ATTR)) return;
+            event?.preventDefault();
+            event?.stopPropagation();
+
+            const editor = ownerDocument.createElement("input");
+            editor.type = "text";
+            editor.value = this.source;
+            editor.setAttribute(EDITOR_ATTR, "");
+            editor.setAttribute("aria-label", "Markdown 图片语法");
+            editor.spellcheck = false;
+            element.setAttribute(EDITING_ATTR, "");
+            element.replaceChildren(editor);
+
+            let finished = false;
+            const finish = (commit) => {
+              if (finished) return;
+              finished = true;
+              const nextSource = editor.value;
+              if (
+                commit &&
+                nextSource !== this.source &&
+                !view.destroyed
+              ) {
+                view.dispatch({
+                  changes: {
+                    from: this.editFrom,
+                    to: this.editTo,
+                    insert: nextSource,
+                  },
+                });
+                return;
+              }
+              renderImage();
+            };
+            editor.addEventListener("mousedown", (inputEvent) => {
+              inputEvent.stopPropagation();
+            });
+            editor.addEventListener("keydown", (inputEvent) => {
+              if (inputEvent.key === "Escape") {
+                inputEvent.preventDefault();
+                finish(false);
+                return;
+              }
+              if (inputEvent.key === "Enter") {
+                inputEvent.preventDefault();
+                finish(true);
+              }
+            });
+            editor.addEventListener("blur", () => finish(true), { once: true });
+            ownerDocument.defaultView?.setTimeout(() => {
+              editor.focus();
+              editor.select();
+            }, 0);
+          };
+
+          element.addEventListener("mousedown", beginEdit);
+          element.addEventListener("keydown", (event) => {
+            if (event.key === "Enter" || event.key === " ") beginEdit(event);
+          });
+          renderImage();
           return element;
         }
       };
@@ -1070,15 +1626,18 @@
       };
     }
 
-    function createMathExtension(runtime, katex) {
+    function createMathExtension(runtime, katex, context) {
       const { Decoration, StateField, DecorationsFacet } = runtime;
       const FormulaWidget = createFormulaWidgetClass(katex);
+      const ImageWidget = createImageWidgetClass(context);
       const MathTableWidget = createMathTableWidgetClass(katex);
 
       function buildDecorations(state) {
         const source = state.doc.toString();
         const ranges = [];
         const mathTables = parseMathTables(state);
+        const images = parseMarkdownImages(source);
+        const formulas = parseMath(source);
         for (const table of mathTables) {
           ranges.push(
             Decoration.replace({
@@ -1087,10 +1646,34 @@
             }).range(table.from, table.to),
           );
         }
-        for (const formula of parseMath(source)) {
+        for (const image of images) {
+          if (
+            mathTables.some((table) => (
+              image.start >= table.from && image.end <= table.to
+            ))
+          ) {
+            continue;
+          }
+          const range = imageRange(image, state);
+          const widget = new ImageWidget(image, range);
+          let decoration;
+          try {
+            decoration = Decoration.replace({
+              widget,
+              block: range.block,
+            }).range(range.from, range.to);
+          } catch {
+            decoration = Decoration.replace({ widget }).range(image.start, image.end);
+          }
+          ranges.push(decoration);
+        }
+        for (const formula of formulas) {
           if (
             mathTables.some((table) => (
               formula.start >= table.from && formula.end <= table.to
+            )) ||
+            images.some((image) => (
+              formula.start < image.end && formula.end > image.start
             ))
           ) {
             continue;
@@ -1155,7 +1738,14 @@
       if (!runtime) return;
 
       const compartment = new runtime.Compartment();
-      const extension = createMathExtension(runtime, katex);
+      const extension = createMathExtension(runtime, katex, {
+        filePath: typeof controller.filePath === "string"
+          ? controller.filePath
+          : markdownFileNameFor(editor),
+        hostId: typeof controller.hostId === "string" && controller.hostId
+          ? controller.hostId
+          : "local",
+      });
       runtime.view.dispatch({
         effects: runtime.StateEffect.appendConfig.of(compartment.of(extension)),
       });
@@ -1224,8 +1814,15 @@
             ),
             0,
           ),
+          renderedImages: Array.from(states.values()).reduce(
+            (count, state) => (
+              count + state.editor.querySelectorAll(`[${IMAGE_ATTR}] img`).length
+            ),
+            0,
+          ),
+          cachedImages: imageCache.size,
           nativeKatexLoaded: !!katexPromise && !lastError,
-          implementation: "CodeMirror state-field replacement widgets",
+          implementation: "CodeMirror formula, table, and image replacement widgets",
           lastError,
           scope: "right-side Markdown file preview only",
         };
@@ -1239,6 +1836,7 @@
       if (scanFrame) cancelAnimationFrame(scanFrame);
       observer.disconnect();
       for (const state of Array.from(states.values())) removeState(state);
+      imageCache.clear();
       style.remove();
       delete window.__bennettMarkdownPreviewMath;
     };
