@@ -1,55 +1,41 @@
 # Bennett UI Improvements for BigPizzaV3 Codex++
 
-Bennett UI Improvements is a BigPizzaV3 Codex++ user script for Markdown preview, sidebar, quota, and settings-page enhancements.
+A renderer-only BigPizzaV3 Codex++ user script migrated from [b-nnett/codex-plusplus-bennett-ui](https://github.com/b-nnett/codex-plusplus-bennett-ui). The migration keeps the original project attribution and adapts the UI features to the BigPizzaV3 user-script runtime.
 
 ## Highlights
 
-- **Markdown math preview** renders formulas and math tables with Codex's built-in KaTeX in the right-side Markdown file preview. Formulas and individual table cells can be edited in place without changing the surrounding layout.
-- **Project colors** add grouped backgrounds and color separation to sidebar projects for faster visual navigation.
-- **Quota display** keeps the 5-hour and weekly remaining quota in one compact sidebar control and switches values on click.
+- **彩色项目管理界面**：为侧栏项目提供分组背景和颜色区分，项目列表更容易扫描和管理。
+- **额度显示**：在左下角显示 5 小时额度，点击可切换 Weekly；只有实际拿到点数数据时才显示 Credit，API 登录显示 `API`，鼠标悬停 5 小时或 Weekly 时显示重置时间。
+- **Markdown 预览公式显示**：在右侧 Markdown 文件预览中使用 Codex 内置 KaTeX 渲染 LaTeX 公式，也支持数学表格和图片预览。
 
-## All features
+## Features
 
 | Feature | Default | Description |
 | --- | --- | --- |
-| Markdown preview math | On | Renders `$...$`, `$$...$$`, `\(...\)`, and `\[...\]` in right-side `.md` and `.markdown` file previews using Codex's built-in KaTeX. Formulas and math-table cells remain in the document layout and support in-place source editing. |
-| Cross-account history refresh | On | Refreshes the cloud conversation list after login or account switching. |
+| Markdown preview math | On | Renders LaTeX formulas, math tables, and images in right-side `.md` and `.markdown` previews. |
 | Project backgrounds and colors | On | Adds grouped backgrounds and color separation to sidebar projects. |
-| 5-hour / weekly quota | On | Shows remaining quota in the sidebar and switches between 5-hour and weekly values on click. API mode displays `API`. |
-| Sidebar action grid | On | Arranges New task, Search, Plugins, and Automations in a compact 2×2 grid. |
+| 5-hour / weekly / Credit quota | On | Shows 5-hour by default, switches to Weekly on click, and shows Credit only when real points data is available. |
+| Cross-account history refresh | On | Refreshes the cloud conversation list after login or account switching. |
+| Hide usage exhaustion alerts | On | Hides quota-exhausted cards and reset prompts without hiding the composer input. |
 | Hide upgrade prompts | On | Hides Upgrade and Get Plus prompts in the sidebar and top bar. |
 | Settings search | On | Adds a search field to Codex Settings. |
 | Matched settings sidebar width | On | Keeps the Settings sidebar aligned with the main sidebar width. |
 | Slash-menu polish | On | Refines row spacing, section labels, and selected states in the slash menu. |
+| Sidebar action grid | On | Arranges common sidebar actions in a compact grid. |
 | Square sidebar corners | Off | Removes the inner rounded corners between the sidebar and main content. |
-| Multi-select sidebar chats | Off | Uses `Cmd/Ctrl + click` to select multiple sidebar chats and opens batch actions from the context menu. |
+| Multi-select sidebar chats | Off | Uses `Cmd/Ctrl + click` to select multiple sidebar chats. |
 
-Every feature can be toggled independently from `Codex++ Manager → Bennett UI Settings`.
+Every feature can be toggled independently from `Codex++ Manager -> Bennett UI 设置`.
 
 ## Install
 
-Copy the ready-to-install script:
-
-```text
-scripts\bennett-ui-improvements.js
-```
-
-to the Codex++ user-script directory:
+Copy `scripts\bennett-ui-improvements.js` to:
 
 ```text
 %APPDATA%\Codex++\user_scripts\
 ```
 
-Enable the script in Codex++ Manager and reload user scripts.
-
-## Console API
-
-```js
-window.__bennettUiImprovementsBigPizza.setFeature("sidebar-action-grid", false);
-window.__bennettUiImprovementsBigPizza.setFeature("sidebar-action-grid", true);
-window.__bennettUiImprovementsBigPizza.setFeature("render-markdown-preview-math", true);
-window.__bennettMarkdownPreviewMath.getStats();
-```
+Enable the script in Codex++ Manager and reload user scripts. The script can also be installed from the Codex++ Script Market after the market entry is merged.
 
 ## Build
 
@@ -57,24 +43,13 @@ window.__bennettMarkdownPreviewMath.getStats();
 .\tools\build-migrated-script.ps1
 ```
 
-The build reads:
+The build reads `old-bennett-ui/index.js` and `features/markdown-preview-math.js`, then writes `scripts/bennett-ui-improvements.js`.
 
-```text
-old-bennett-ui/index.js
-features/markdown-preview-math.js
-```
+## Attribution
 
-and writes:
-
-```text
-scripts/bennett-ui-improvements.js
-```
-
-## Source
-
-- Bennett UI: `https://github.com/b-nnett/codex-plusplus-bennett-ui`
-- Codex++: `https://github.com/BigPizzaV3/CodexPlusPlus`
-- Codex++ Script Market: `https://github.com/BigPizzaV3/CodexPlusPlusScriptMarket`
+- Original UI project: [b-nnett/codex-plusplus-bennett-ui](https://github.com/b-nnett/codex-plusplus-bennett-ui)
+- Runtime target: [BigPizzaV3/CodexPlusPlus](https://github.com/BigPizzaV3/CodexPlusPlus)
+- Maintainer and migration work: [JHees](https://github.com/JHees)
 
 ## License
 
