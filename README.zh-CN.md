@@ -4,7 +4,7 @@
 
 **专为 BigPizzaV3 Codex++ 打造的界面与工作流增强脚本。**
 
-[![Version](https://img.shields.io/badge/version-1.2.0-14b8a6)](https://github.com/JHees/bennett-ui-improvements-for-codexplusplus)
+[![Version](https://img.shields.io/badge/version-1.2.1-14b8a6)](https://github.com/JHees/bennett-ui-improvements-for-codexplusplus)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Runtime](https://img.shields.io/badge/runtime-Codex%2B%2B-111827)](https://github.com/BigPizzaV3/CodexPlusPlus)
 [![Mode](https://img.shields.io/badge/mode-renderer--only-7c3aed)](#兼容性)
@@ -36,7 +36,7 @@ Bennett UI Improvements 是适用于 [BigPizzaV3 Codex++](https://github.com/Big
 2. 搜索并安装 **Bennett UI Improvements**。
 3. 启用脚本，然后点击 **重新加载用户脚本**。
 
-Bennett UI 1.2.0 已经内置原生会话加载器，**不需要**再单独安装 Codex List Pagebuster。
+Bennett UI 1.2.1 已经内置原生会话加载器，**不需要**再单独安装 Codex List Pagebuster。
 
 ### 手动安装
 
@@ -61,18 +61,14 @@ Bennett UI 1.2.0 已经内置原生会话加载器，**不需要**再单独安�
 | 匹配设置页侧栏宽度 | 开启 | 稳定 |
 | 紧凑侧栏动作网格 | 开启 | 稳定 |
 | 斜杠菜单优化 | 开启 | 稳定 |
-| 跨账号会话刷新 | 开启 | 取决于当前 provider |
 | 原生会话历史加载 | 手动 | 稳定；可设置 1–2000 条 |
 | 侧栏方角 | 关闭 | 稳定 |
-| 侧栏会话多选 | 关闭 | 部分支持；旧版批量 IPC 操作不可用 |
-| 消息 token 指标 | 关闭 | renderer-only 环境不支持 |
-| 固定会话项目名 | 关闭 | renderer-only 环境不支持 |
 
 所有功能开关和会话加载入口都位于 **Codex++ 管理工具 → Bennett UI 设置**。设置保存在本地，重新加载脚本不会覆盖用户选择。
 
 ## 原生会话历史加载
 
-1.2.0 已将原生历史加载器直接合并进 Bennett UI：
+1.2.1 已将原生历史加载器直接合并进 Bennett UI：
 
 - 保留数量可设置为 **1–2000** 条，默认 **500** 条。
 - 只有点击 **手动加载会话** 时才执行，不在启动时扫描全部历史。
@@ -81,7 +77,7 @@ Bennett UI 1.2.0 已经内置原生会话加载器，**不需要**再单独安�
 - 侧栏渲染与虚拟滚动仍完全由 Codex 负责。
 - 不注入替代会话行、不拦截网络请求，也不使用全局 `MutationObserver` 持续扫描页面。
 
-如果旧环境仍启用了独立 Pagebuster，两个脚本会使用同一个全局入口并自动交接，只保留一个活动实例。确认 Bennett UI 1.2.0 工作正常后，可以卸载独立 Pagebuster。
+如果旧环境仍启用了独立 Pagebuster，两个脚本会使用同一个全局入口并自动交接，只保留一个活动实例。确认 Bennett UI 1.2.1 工作正常后，可以卸载独立 Pagebuster。
 
 启用 cc-switch 的“同步会话”后，Bennett 读取的是同一 `.codex` 存储的两种运行时视图——CLI 索引与 renderer 摘要，不会创建第二份会话数据库。
 

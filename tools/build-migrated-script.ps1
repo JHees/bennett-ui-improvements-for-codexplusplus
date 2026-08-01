@@ -14,9 +14,6 @@ $previewMathFeaturePath = Resolve-Path -LiteralPath "features\markdown-preview-m
 $sourceText = Get-Content -LiteralPath $sourcePath -Raw -Encoding utf8
 $sourceText = $sourceText -replace "\r\n", "`n"
 $sourceText = $sourceText.Replace('"show-usage-in-sidebar": false', '"show-usage-in-sidebar": true')
-$sourceText = $sourceText.Replace('"show-message-metrics-on-hover": true', '"show-message-metrics-on-hover": false')
-$sourceText = $sourceText.Replace('"sidebar-chat-multi-select": true', '"sidebar-chat-multi-select": false')
-$sourceText = $sourceText.Replace('"show-pinned-chat-project-names": true', '"show-pinned-chat-project-names": false')
 $sourceText = $sourceText.Replace(
   '"sidebar-project-backgrounds": true',
   '"sidebar-project-backgrounds": true,' + "`n" + '        "render-markdown-preview-math": true'
@@ -659,7 +656,7 @@ $prefix = @'
   "use strict";
 
   const INSTALL_KEY = "__bennettUiImprovementsBigPizza";
-  const VERSION = "1.0.23-bigpizza.9";
+  const VERSION = "1.2.1";
   const previous = window[INSTALL_KEY];
   if (previous && typeof previous.stop === "function") {
     try {
@@ -693,10 +690,6 @@ $suffix = @'
     "sidebar-project-backgrounds",
     "render-markdown-preview-math",
     "slash-menu-polish",
-    "cross-account-history-refresh",
-    "show-message-metrics-on-hover",
-    "sidebar-chat-multi-select",
-    "show-pinned-chat-project-names",
     "hide-usage-alert",
   ];
   const featureInfo = [
@@ -769,36 +762,6 @@ $suffix = @'
       detail: "压缩斜杠菜单行距，并强化选中状态。",
       defaultEnabled: true,
       status: "可用",
-    },
-    {
-      id: "cross-account-history-refresh",
-      title: "跨账号会话刷新",
-      detail: "登录或切换账号后刷新云端会话列表。",
-      defaultEnabled: true,
-      status: "可用",
-    },
-    {
-      id: "show-message-metrics-on-hover",
-      title: "消息 token 指标",
-      detail: "旧实现需要从 main process 读取本地 Codex JSONL，而 BigPizzaV3 用户脚本无法访问这一层。",
-      defaultEnabled: false,
-      status: "当前运行环境不支持",
-      disabled: true,
-    },
-    {
-      id: "sidebar-chat-multi-select",
-      title: "侧栏会话多选",
-      detail: "选择界面可以部分运行，但批量 Pin / Archive / mini window 操作依赖旧的 Electron IPC。",
-      defaultEnabled: false,
-      status: "部分支持，默认关闭",
-    },
-    {
-      id: "show-pinned-chat-project-names",
-      title: "固定会话项目名",
-      detail: "旧实现需要从 main process 扫描本地会话文件。",
-      defaultEnabled: false,
-      status: "当前运行环境不支持",
-      disabled: true,
     },
   ];
   const settingsObserver = new MutationObserver(installSettingsPanel);
@@ -968,8 +931,6 @@ $suffix = @'
   function createBigPizzaRendererApi() {
     const storagePrefix = "bennett-ui-improvements:";
     const blockedFeatureKeys = new Set([
-      "feature:show-message-metrics-on-hover",
-      "feature:show-pinned-chat-project-names",
     ]);
     const noop = () => {};
     const logWith = (level) => (...args) => {
