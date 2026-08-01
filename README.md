@@ -4,7 +4,7 @@
 
 **A focused UI and workflow upgrade for BigPizzaV3 Codex++.**
 
-[![Version](https://img.shields.io/badge/version-1.2.1-14b8a6)](https://github.com/JHees/bennett-ui-improvements-for-codexplusplus)
+[![Version](https://img.shields.io/badge/version-1.2.2-14b8a6)](https://github.com/JHees/bennett-ui-improvements-for-codexplusplus)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Runtime](https://img.shields.io/badge/runtime-Codex%2B%2B-111827)](https://github.com/BigPizzaV3/CodexPlusPlus)
 [![Mode](https://img.shields.io/badge/mode-renderer--only-7c3aed)](#compatibility)
@@ -23,7 +23,7 @@ This project adapts [b-nnett/codex-plusplus-bennett-ui](https://github.com/b-nne
 | --- | --- |
 | Sidebar | Project colors and backgrounds, compact action grid, optional square corners, and slash-menu polish. |
 | Usage | Real 5-hour and weekly quota data, optional Credit view, reset-time tooltips, and explicit `API` mode. |
-| History | Manually load 1–2000 conversations into Codex's native cache without custom sidebar rows. |
+| History | Automatically load 1–2000 conversations into Codex's native cache without custom sidebar rows. |
 | Markdown | KaTeX formulas, math tables, images, relative image paths, and source inspection in `.md` previews. |
 | Settings | A dedicated Bennett UI panel with per-feature switches and a native-history load control. |
 | Noise reduction | Hides quota-exhaustion and Plus/Pro upsell surfaces while preserving the composer and app-update notices. |
@@ -61,23 +61,23 @@ Enable the script in Codex++ and reload user scripts. A full Codex restart is no
 | Match settings-sidebar width | On | Stable |
 | Compact sidebar action grid | On | Stable |
 | Slash-menu polish | On | Stable |
-| Native conversation-history load | Manual | Stable; configurable from 1 to 2000 conversations |
+| Native conversation-history load | Automatic | Loads once at startup; configurable from 1 to 2000 conversations with manual retry |
 | Square sidebar corners | Off | Stable |
 
 Feature switches and the history loader are available under **Codex++ Management Tools → Bennett UI Settings**. Preferences are stored locally and survive script reloads.
 
 ## Native conversation history
 
-Version 1.2.1 embeds the native history loader directly in Bennett UI:
+The embedded native history loader:
 
 - Choose a retention target from **1–2000** conversations; the default is **500**.
-- Loading starts only when you select **Load conversations manually**.
+- Loading runs once whenever Codex starts; startup failures receive limited retries, and **Load conversations manually** remains available for an immediate retry.
 - CLI conversation IDs and renderer-known summaries are merged and deduplicated by conversation ID.
 - Missing summaries are hydrated in small batches through Codex's own interfaces.
 - Codex remains responsible for sidebar rendering and virtual scrolling.
 - The loader does not inject replacement conversation rows, intercept network requests, or continuously scan the page with a global `MutationObserver`.
 
-If a standalone Pagebuster installation is still enabled, both scripts use the same global entry point and hand off to a single active instance. Once Bennett UI 1.2.1 is working, the standalone Pagebuster script can be removed.
+If a standalone Pagebuster installation is still enabled, both scripts use the same global entry point and hand off to a single active instance. Once Bennett UI is working, the standalone Pagebuster script can be removed.
 
 When cc-switch unified session history is enabled, Bennett reads two runtime views of the same `.codex` store—the CLI index and renderer summaries. It does not create a second conversation database.
 
@@ -97,8 +97,8 @@ The right-side Markdown preview supports:
 - Inline and display math: `$...$`, `$$...$$`, `\(...\)`, and `\[...\]`.
 - Codex's bundled KaTeX renderer—no external math CDN is required.
 - Markdown tables, including math content inside cells.
-- Local and relative image paths resolved from the current document.
-- Selecting rendered math to inspect its LaTeX source.
+- Local and relative images resolved from the current document and loaded through Codex's native media protocol when they approach the viewport.
+- In-place source editing for formulas, images, and individual math-table cells.
 
 ## Compatibility
 

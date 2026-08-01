@@ -15,9 +15,12 @@
     const IMAGE_ATTR = "data-bennett-markdown-preview-image";
     const IMAGE_STATUS_ATTR = "data-bennett-markdown-preview-image-status";
     const IMAGE_MAX_BYTES = 20 * 1024 * 1024;
+    const IMAGE_READ_CONCURRENCY = 2;
     const MARKDOWN_EXTENSION = /\.(?:md|markdown|mdown|mkd)$/i;
     const states = new Map();
     const imageCache = new Map();
+    const imageReadQueue = [];
+    let activeImageReads = 0;
     let disposed = false;
     let scanFrame = 0;
     let scanning = false;
@@ -316,16 +319,22 @@
 
     function dispatchDesktopViewMessage(message) {
       let forwarded = false;
+      let pending = null;
       const bridge = window.electronBridge;
       if (typeof bridge?.sendMessageFromView === "function") {
         forwarded = true;
-        bridge.sendMessageFromView(message).catch(() => {});
+        try {
+          pending = Promise.resolve(bridge.sendMessageFromView(message));
+        } catch (error) {
+          pending = Promise.reject(error);
+        }
       }
       const event = new CustomEvent("codex-message-from-view", {
         detail: message,
       });
       if (forwarded) event.__codexForwardedViaBridge = true;
       window.dispatchEvent(event);
+      return pending;
     }
 
     function requestDesktopJson(command, params, timeoutMs = 15_000) {
@@ -381,7 +390,7 @@
           finish(reject, new Error(`${command} timed out`));
         }, timeoutMs);
         window.addEventListener("message", onMessage);
-        dispatchDesktopViewMessage({
+        const pending = dispatchDesktopViewMessage({
           type: "fetch",
           requestId,
           method: "POST",
@@ -391,6 +400,32 @@
           },
           body: JSON.stringify(params),
         });
+        pending?.catch((error) => finish(reject, error));
+      });
+    }
+
+    function pumpImageReadQueue() {
+      while (
+        !disposed &&
+        activeImageReads < IMAGE_READ_CONCURRENCY &&
+        imageReadQueue.length
+      ) {
+        const entry = imageReadQueue.shift();
+        activeImageReads += 1;
+        Promise.resolve()
+          .then(entry.task)
+          .then(entry.resolve, entry.reject)
+          .finally(() => {
+            activeImageReads -= 1;
+            pumpImageReadQueue();
+          });
+      }
+    }
+
+    function enqueueImageRead(task) {
+      return new Promise((resolve, reject) => {
+        imageReadQueue.push({ task, resolve, reject });
+        pumpImageReadQueue();
       });
     }
 
@@ -575,18 +610,37 @@
       }[extension] || null;
     }
 
+    function codexLocalMediaUrl(path) {
+      if (
+        !/^[A-Za-z]:[\\/]/.test(path) &&
+        !/^[\\/]{2}/.test(path) &&
+        !path.startsWith("/")
+      ) {
+        return null;
+      }
+      const normalized = path.replace(/\\/g, "/");
+      const encoded = encodeURI(normalized)
+        .replaceAll("#", "%23")
+        .replaceAll("?", "%3F");
+      return `app://fs/@fs${encoded}`;
+    }
+
     function loadImageSource(target, filePath, hostId) {
       const resolved = resolveImageTarget(target, filePath);
       if (!resolved) return Promise.reject(new Error("图片路径为空"));
       if (/^(?:data|https?):/i.test(resolved)) return Promise.resolve(resolved);
+      if (!hostId || hostId === "local") {
+        const localMediaUrl = codexLocalMediaUrl(resolved);
+        if (localMediaUrl) return Promise.resolve(localMediaUrl);
+      }
       const key = `${hostId || "local"}\n${resolved}`;
       let pending = imageCache.get(key);
       if (pending) return pending;
-      pending = requestDesktopJson("read-file-binary", {
+      pending = enqueueImageRead(() => requestDesktopJson("read-file-binary", {
         hostId: hostId || "local",
         path: resolved,
         maxBytes: IMAGE_MAX_BYTES,
-      }, 20_000)
+      }, 60_000))
         .then((result) => {
           if (!result?.contentsBase64) {
             if (/^https?:\/\//i.test(resolved)) return resolved;
@@ -1227,7 +1281,9 @@
         }
 
         destroy(dom) {
-          if (dom) dom.__bennettImageActive = false;
+          if (!dom) return;
+          dom.__bennettImageActive = false;
+          dom.__bennettImageObserver?.disconnect();
         }
 
         toDOM(view) {
@@ -1240,19 +1296,25 @@
           element.setAttribute("aria-label", this.alt || this.title || this.target);
           element.tabIndex = 0;
           element.title = "单击编辑图片语法，Enter 提交，Esc 取消";
+          const loadingMessage = this.alt.trim()
+            ? `正在加载${this.alt.trim()}图片`
+            : "正在加载图片";
 
-          const renderStatus = (status, message) => {
+          let imageObserver = null;
+          let loadingStarted = false;
+
+          const renderStatus = (status, message, measure = true) => {
             element.removeAttribute(EDITING_ATTR);
             const statusElement = ownerDocument.createElement("span");
             statusElement.setAttribute(IMAGE_STATUS_ATTR, status);
             statusElement.textContent = message;
             element.replaceChildren(statusElement);
-            view.requestMeasure?.();
+            if (measure) view.requestMeasure?.();
           };
 
           const renderImage = () => {
             if (!element.__bennettImageActive) return;
-            renderStatus("loading", `正在加载图片：${this.alt || this.target}`);
+            renderStatus("loading", loadingMessage);
             loadImageSource(this.target, this.filePath, this.hostId)
               .then((source) => {
                 if (
@@ -1298,6 +1360,7 @@
             if (element.hasAttribute(EDITING_ATTR)) return;
             event?.preventDefault();
             event?.stopPropagation();
+            imageObserver?.disconnect();
 
             const editor = ownerDocument.createElement("input");
             editor.type = "text";
@@ -1327,6 +1390,7 @@
                 });
                 return;
               }
+              loadingStarted = true;
               renderImage();
             };
             editor.addEventListener("mousedown", (inputEvent) => {
@@ -1354,7 +1418,33 @@
           element.addEventListener("keydown", (event) => {
             if (event.key === "Enter" || event.key === " ") beginEdit(event);
           });
-          renderImage();
+          const startLoading = () => {
+            if (loadingStarted || !element.__bennettImageActive) return;
+            loadingStarted = true;
+            imageObserver?.disconnect();
+            imageObserver = null;
+            element.__bennettImageObserver = null;
+            renderImage();
+          };
+          renderStatus(
+            "waiting",
+            loadingMessage,
+            false,
+          );
+          const IntersectionObserverClass = ownerDocument.defaultView?.IntersectionObserver;
+          if (typeof IntersectionObserverClass === "function") {
+            imageObserver = new IntersectionObserverClass((entries) => {
+              if (entries.some((entry) => entry.isIntersecting)) startLoading();
+            }, {
+              root: view.scrollDOM instanceof Element ? view.scrollDOM : null,
+              rootMargin: "400px 0px",
+              threshold: 0,
+            });
+            element.__bennettImageObserver = imageObserver;
+            imageObserver.observe(element);
+          } else {
+            startLoading();
+          }
           return element;
         }
       };
@@ -1821,6 +1911,8 @@
             0,
           ),
           cachedImages: imageCache.size,
+          queuedImageReads: imageReadQueue.length,
+          activeImageReads,
           nativeKatexLoaded: !!katexPromise && !lastError,
           implementation: "CodeMirror formula, table, and image replacement widgets",
           lastError,
@@ -1836,6 +1928,9 @@
       if (scanFrame) cancelAnimationFrame(scanFrame);
       observer.disconnect();
       for (const state of Array.from(states.values())) removeState(state);
+      while (imageReadQueue.length) {
+        imageReadQueue.shift().reject(new Error("图片预览已停止"));
+      }
       imageCache.clear();
       style.remove();
       delete window.__bennettMarkdownPreviewMath;

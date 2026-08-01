@@ -21,11 +21,7 @@
   "use strict";
 
   const INSTALL_KEY = "__bennettUiImprovementsBigPizza";
-  const VERSION = "1.2.1";
-  const HISTORY_TARGET_STORAGE_KEY = "__codexListPagebusterTarget";
-  const HISTORY_TARGET_DEFAULT = 500;
-  const HISTORY_TARGET_MIN = 1;
-  const HISTORY_TARGET_MAX = 2000;
+  const VERSION = "1.2.2";
   const previous = window[INSTALL_KEY];
   if (previous && typeof previous.stop === "function") {
     try {
@@ -378,9 +374,12 @@ const FEATURES = {
     const IMAGE_ATTR = "data-bennett-markdown-preview-image";
     const IMAGE_STATUS_ATTR = "data-bennett-markdown-preview-image-status";
     const IMAGE_MAX_BYTES = 20 * 1024 * 1024;
+    const IMAGE_READ_CONCURRENCY = 2;
     const MARKDOWN_EXTENSION = /\.(?:md|markdown|mdown|mkd)$/i;
     const states = new Map();
     const imageCache = new Map();
+    const imageReadQueue = [];
+    let activeImageReads = 0;
     let disposed = false;
     let scanFrame = 0;
     let scanning = false;
@@ -679,16 +678,22 @@ const FEATURES = {
 
     function dispatchDesktopViewMessage(message) {
       let forwarded = false;
+      let pending = null;
       const bridge = window.electronBridge;
       if (typeof bridge?.sendMessageFromView === "function") {
         forwarded = true;
-        bridge.sendMessageFromView(message).catch(() => {});
+        try {
+          pending = Promise.resolve(bridge.sendMessageFromView(message));
+        } catch (error) {
+          pending = Promise.reject(error);
+        }
       }
       const event = new CustomEvent("codex-message-from-view", {
         detail: message,
       });
       if (forwarded) event.__codexForwardedViaBridge = true;
       window.dispatchEvent(event);
+      return pending;
     }
 
     function requestDesktopJson(command, params, timeoutMs = 15_000) {
@@ -744,7 +749,7 @@ const FEATURES = {
           finish(reject, new Error(`${command} timed out`));
         }, timeoutMs);
         window.addEventListener("message", onMessage);
-        dispatchDesktopViewMessage({
+        const pending = dispatchDesktopViewMessage({
           type: "fetch",
           requestId,
           method: "POST",
@@ -754,6 +759,32 @@ const FEATURES = {
           },
           body: JSON.stringify(params),
         });
+        pending?.catch((error) => finish(reject, error));
+      });
+    }
+
+    function pumpImageReadQueue() {
+      while (
+        !disposed &&
+        activeImageReads < IMAGE_READ_CONCURRENCY &&
+        imageReadQueue.length
+      ) {
+        const entry = imageReadQueue.shift();
+        activeImageReads += 1;
+        Promise.resolve()
+          .then(entry.task)
+          .then(entry.resolve, entry.reject)
+          .finally(() => {
+            activeImageReads -= 1;
+            pumpImageReadQueue();
+          });
+      }
+    }
+
+    function enqueueImageRead(task) {
+      return new Promise((resolve, reject) => {
+        imageReadQueue.push({ task, resolve, reject });
+        pumpImageReadQueue();
       });
     }
 
@@ -938,18 +969,37 @@ const FEATURES = {
       }[extension] || null;
     }
 
+    function codexLocalMediaUrl(path) {
+      if (
+        !/^[A-Za-z]:[\\/]/.test(path) &&
+        !/^[\\/]{2}/.test(path) &&
+        !path.startsWith("/")
+      ) {
+        return null;
+      }
+      const normalized = path.replace(/\\/g, "/");
+      const encoded = encodeURI(normalized)
+        .replaceAll("#", "%23")
+        .replaceAll("?", "%3F");
+      return `app://fs/@fs${encoded}`;
+    }
+
     function loadImageSource(target, filePath, hostId) {
       const resolved = resolveImageTarget(target, filePath);
       if (!resolved) return Promise.reject(new Error("图片路径为空"));
       if (/^(?:data|https?):/i.test(resolved)) return Promise.resolve(resolved);
+      if (!hostId || hostId === "local") {
+        const localMediaUrl = codexLocalMediaUrl(resolved);
+        if (localMediaUrl) return Promise.resolve(localMediaUrl);
+      }
       const key = `${hostId || "local"}\n${resolved}`;
       let pending = imageCache.get(key);
       if (pending) return pending;
-      pending = requestDesktopJson("read-file-binary", {
+      pending = enqueueImageRead(() => requestDesktopJson("read-file-binary", {
         hostId: hostId || "local",
         path: resolved,
         maxBytes: IMAGE_MAX_BYTES,
-      }, 20_000)
+      }, 60_000))
         .then((result) => {
           if (!result?.contentsBase64) {
             if (/^https?:\/\//i.test(resolved)) return resolved;
@@ -1590,7 +1640,9 @@ const FEATURES = {
         }
 
         destroy(dom) {
-          if (dom) dom.__bennettImageActive = false;
+          if (!dom) return;
+          dom.__bennettImageActive = false;
+          dom.__bennettImageObserver?.disconnect();
         }
 
         toDOM(view) {
@@ -1603,19 +1655,25 @@ const FEATURES = {
           element.setAttribute("aria-label", this.alt || this.title || this.target);
           element.tabIndex = 0;
           element.title = "单击编辑图片语法，Enter 提交，Esc 取消";
+          const loadingMessage = this.alt.trim()
+            ? `正在加载${this.alt.trim()}图片`
+            : "正在加载图片";
 
-          const renderStatus = (status, message) => {
+          let imageObserver = null;
+          let loadingStarted = false;
+
+          const renderStatus = (status, message, measure = true) => {
             element.removeAttribute(EDITING_ATTR);
             const statusElement = ownerDocument.createElement("span");
             statusElement.setAttribute(IMAGE_STATUS_ATTR, status);
             statusElement.textContent = message;
             element.replaceChildren(statusElement);
-            view.requestMeasure?.();
+            if (measure) view.requestMeasure?.();
           };
 
           const renderImage = () => {
             if (!element.__bennettImageActive) return;
-            renderStatus("loading", `正在加载图片：${this.alt || this.target}`);
+            renderStatus("loading", loadingMessage);
             loadImageSource(this.target, this.filePath, this.hostId)
               .then((source) => {
                 if (
@@ -1661,6 +1719,7 @@ const FEATURES = {
             if (element.hasAttribute(EDITING_ATTR)) return;
             event?.preventDefault();
             event?.stopPropagation();
+            imageObserver?.disconnect();
 
             const editor = ownerDocument.createElement("input");
             editor.type = "text";
@@ -1690,6 +1749,7 @@ const FEATURES = {
                 });
                 return;
               }
+              loadingStarted = true;
               renderImage();
             };
             editor.addEventListener("mousedown", (inputEvent) => {
@@ -1717,7 +1777,33 @@ const FEATURES = {
           element.addEventListener("keydown", (event) => {
             if (event.key === "Enter" || event.key === " ") beginEdit(event);
           });
-          renderImage();
+          const startLoading = () => {
+            if (loadingStarted || !element.__bennettImageActive) return;
+            loadingStarted = true;
+            imageObserver?.disconnect();
+            imageObserver = null;
+            element.__bennettImageObserver = null;
+            renderImage();
+          };
+          renderStatus(
+            "waiting",
+            loadingMessage,
+            false,
+          );
+          const IntersectionObserverClass = ownerDocument.defaultView?.IntersectionObserver;
+          if (typeof IntersectionObserverClass === "function") {
+            imageObserver = new IntersectionObserverClass((entries) => {
+              if (entries.some((entry) => entry.isIntersecting)) startLoading();
+            }, {
+              root: view.scrollDOM instanceof Element ? view.scrollDOM : null,
+              rootMargin: "400px 0px",
+              threshold: 0,
+            });
+            element.__bennettImageObserver = imageObserver;
+            imageObserver.observe(element);
+          } else {
+            startLoading();
+          }
           return element;
         }
       };
@@ -2184,6 +2270,8 @@ const FEATURES = {
             0,
           ),
           cachedImages: imageCache.size,
+          queuedImageReads: imageReadQueue.length,
+          activeImageReads,
           nativeKatexLoaded: !!katexPromise && !lastError,
           implementation: "CodeMirror formula, table, and image replacement widgets",
           lastError,
@@ -2199,6 +2287,9 @@ const FEATURES = {
       if (scanFrame) cancelAnimationFrame(scanFrame);
       observer.disconnect();
       for (const state of Array.from(states.values())) removeState(state);
+      while (imageReadQueue.length) {
+        imageReadQueue.shift().reject(new Error("图片预览已停止"));
+      }
       imageCache.clear();
       style.remove();
       delete window.__bennettMarkdownPreviewMath;
@@ -2206,7 +2297,7 @@ const FEATURES = {
   },
 
   /**
-   * Hide the "Upgrade" / "Get Plus" buttons. We match by visible text
+   * Hide the Plus/Pro plan "Upgrade" / "Get Plus" buttons while keeping Codex software-update notices visible. We match by visible text
    * across the document, skipping anything inside Codex's settings shell
    * or our own injected panels. Hidden via inline `display:none` so we
    * can restore it cleanly on dispose.
@@ -2225,6 +2316,8 @@ const FEATURES = {
       "upgrade to plus",
     ]);
     const CONTAINS = ["upgrade for higher limits"];
+    const APP_UPDATE_CONTEXT_RE =
+      /(?:\b(?:app|application|desktop|codex)\s+(?:update|upgrade|version|release)\b|\b(?:update|updated|updating|new version|latest version|release|download|restart|install)\b|软件升级|应用升级|版本升级|新版本|软件更新|应用更新|更新可用|下载更新|重启更新|安装包)/i;
     const hidden = new Set(/* HTMLElement */);
 
     const isInsideOurShell = (el) => {
@@ -2236,18 +2329,43 @@ const FEATURES = {
       return false;
     };
 
-    // Codex sometimes splits the label across icon + text spans, so we use
-    // textContent and collapse whitespace.
+    // Codex may split a label across icon + text spans, so use textContent
+    // for the button itself and semantic attributes for update banners.
     const normText = (el) =>
       (el.textContent || "").replace(/\s+/g, " ").trim().toLowerCase();
+    const semanticText = (el) =>
+      [
+        el.textContent,
+        el.getAttribute("aria-label"),
+        el.getAttribute("title"),
+        el.getAttribute("data-testid"),
+        el.getAttribute("data-test"),
+        el.id,
+        typeof el.className === "string" ? el.className : "",
+      ]
+        .filter(Boolean)
+        .join(" ")
+        .replace(/\s+/g, " ")
+        .trim()
+        .toLowerCase();
 
-    const matches = (text) => {
-      if (!text) return false;
+    const isAppUpdateControl = (el) => {
+      let n = el;
+      for (let depth = 0; n && depth < 5; depth += 1, n = n.parentElement) {
+        const text = semanticText(n);
+        // Avoid matching against the entire document body, which could contain
+        // an unrelated update message elsewhere in the page.
+        if (text.length <= 240 && APP_UPDATE_CONTEXT_RE.test(text)) return true;
+      }
+      return false;
+    };
+
+    const matches = (el, text) => {
+      if (!text || isAppUpdateControl(el)) return false;
       if (EXACT.has(text)) return true;
       for (const c of CONTAINS) if (text.includes(c)) return true;
       return false;
     };
-
     const scan = () => {
       const candidates = document.querySelectorAll(
         'button, a, [role="button"], [role="menuitem"]',
@@ -2257,7 +2375,7 @@ const FEATURES = {
         if (isInsideOurShell(el)) continue;
         const t = normText(el);
         if (t.length === 0 || t.length > 80) continue;
-        if (!matches(t)) continue;
+        if (!matches(el, t)) continue;
         const host = el.closest('[class*="rounded"], [class*="badge"]') || el;
         if (!(host instanceof HTMLElement)) continue;
         host.dataset.codexppPrevDisplay = host.style.display || "";
@@ -2323,9 +2441,6 @@ const FEATURES = {
     let accountModeInFlight = false;
     let accountModeLastCheckedAt = 0;
     let accountModeLogged = false;
-    let accountModeCandidate = "unknown";
-    let accountModeCandidateCount = 0;
-    let accountModeCandidateAt = 0;
 
     const log = (...a) => api.log.info("[usage]", ...a);
     const ASIDE_SELECTOR = [
@@ -2595,7 +2710,7 @@ const FEATURES = {
       accountModeInFlight = true;
       try {
         let nextMode = "unknown";
-        let explicitMode = false;
+        let settingsMode = "unknown";
         const settings = await bridgePostJson("/settings/get", {});
         const profile = activeRelayProfile(settings);
         const relayMode = fieldValue(profile, "relayMode", "relay_mode");
@@ -2606,16 +2721,12 @@ const FEATURES = {
         );
         if (relayMode === "official" && !officialMixApiKey) {
           nextMode = "official";
-          explicitMode = true;
         } else if (relayMode === "pureApi" || relayMode === "pure_api") {
           nextMode = "api";
-          explicitMode = true;
         } else if (relayMode === "mixedApi" || relayMode === "mixed_api" || officialMixApiKey) {
           nextMode = "api";
-          explicitMode = true;
         } else if (!relayMode && legacyApiConfigured) {
           nextMode = "api";
-          explicitMode = true;
         }
 
         if (nextMode === "unknown") {
@@ -2625,47 +2736,23 @@ const FEATURES = {
             nextMode = "official";
           }
         }
-        if (nextMode === "unknown") return accountMode;
+        if (nextMode === "unknown") nextMode = settingsMode;
 
-        // Catalog responses can briefly reflect the previous provider while
-        // Codex is switching accounts. Require two matching non-explicit
-        // observations before changing the visible mode.
-        if (nextMode === accountMode) {
-          accountModeCandidate = "unknown";
-          accountModeCandidateCount = 0;
-          accountModeCandidateAt = 0;
-          return accountMode;
-        }
-        if (accountMode !== "unknown" || !explicitMode) {
-          if (
-            accountModeCandidate === nextMode &&
-            now - accountModeCandidateAt < 45_000
-          ) {
-            accountModeCandidateCount += 1;
-          } else {
-            accountModeCandidate = nextMode;
-            accountModeCandidateCount = 1;
-            accountModeCandidateAt = now;
+        if (nextMode !== "unknown" && nextMode !== accountMode) {
+          accountMode = nextMode;
+          if (accountMode === "api") {
+            snapshot = {
+              fiveHour: { label: "API", pct: null, resetAt: null, apiMode: true },
+              weekly: null,
+              at: Date.now(),
+              apiMode: true,
+            };
+          } else if (snapshot?.apiMode) {
+            snapshot = null;
           }
-          if (accountModeCandidateCount < 2) return accountMode;
+          ensureMounted(true);
         }
-
-        accountModeCandidate = "unknown";
-        accountModeCandidateCount = 0;
-        accountModeCandidateAt = 0;
-        accountMode = nextMode;
-        if (accountMode === "api") {
-          snapshot = {
-            fiveHour: { label: "API", pct: null, resetAt: null, apiMode: true },
-            weekly: null,
-            at: Date.now(),
-            apiMode: true,
-          };
-        } else if (snapshot?.apiMode) {
-          snapshot = null;
-        }
-        ensureMounted(true);
-        if (!accountModeLogged) {
+        if (!accountModeLogged && accountMode !== "unknown") {
           accountModeLogged = true;
           log("account mode", accountMode);
         }
@@ -2676,6 +2763,7 @@ const FEATURES = {
         accountModeInFlight = false;
       }
     };
+
     const remainingPercent = (usedPercent) => {
       const used = Number(usedPercent);
       if (!Number.isFinite(used)) return null;
@@ -3425,41 +3513,29 @@ const FEATURES = {
     ensureMounted(true);
 
     // ── observers ─────────────────────────────────────────────────────
-    // Codex mutates the renderer continuously while typing. Debounce quota
-    // work so we do not rescan the entire sidebar on every React commit.
+    // We throttle to one tick per animation frame so a flood of React
+    // re-renders can't tank the renderer (Codex mutates the DOM heavily
+    // while typing). Coalesces N onMutate() calls into one scan.
     let scheduled = false;
-    let scheduleTimer = 0;
-    const runMutationScan = async () => {
-      const mode = await refreshAccountMode();
-      if (mode === "official") await refreshUsageFromApi();
-      if (accountMode === "official" && !directUsageAvailable) {
-        const grid = findBreakdownGrid();
-        if (grid) scanBreakdown(grid);
-        scanCompactUsage();
-      }
-      ensureMounted();
-    };
     const onMutate = () => {
       if (scheduled) return;
       scheduled = true;
-      scheduleTimer = window.setTimeout(() => {
-        scheduleTimer = 0;
+      requestAnimationFrame(() => {
         scheduled = false;
-        void runMutationScan();
-      }, 1000);
+        refreshAccountMode().then((mode) => {
+          if (mode === "official") refreshUsageFromApi();
+        });
+        if (accountMode === "official" && !directUsageAvailable) {
+          const grid = findBreakdownGrid();
+          if (grid) scanBreakdown(grid);
+          scanCompactUsage();
+        }
+        ensureMounted();
+      });
     };
 
     onMutate();
-    const IGNORED_MUTATION_SELECTOR =
-      "[data-codexpp], [data-codex-composer-root], [data-codex-composer='true'], [contenteditable='true'], textarea, [data-composer-overlay-floating-ui]";
-    const obs = new MutationObserver((records) => {
-      const relevant = records.some((record) => {
-        const target = record.target;
-        const element = target instanceof Element ? target : target?.parentElement;
-        return !(element instanceof Element && element.closest(IGNORED_MUTATION_SELECTOR));
-      });
-      if (relevant) onMutate();
-    });
+    const obs = new MutationObserver(onMutate);
     obs.observe(document.documentElement, { childList: true, subtree: true });
     const interval = window.setInterval(onMutate, 15_000);
     window.addEventListener("focus", onMutate);
@@ -3471,7 +3547,6 @@ const FEATURES = {
     return () => {
       obs.disconnect();
       window.clearInterval(interval);
-      if (scheduleTimer) window.clearTimeout(scheduleTimer);
       window.removeEventListener("focus", onMutate);
       window.removeEventListener("message", onUsageMessage);
       document.removeEventListener("visibilitychange", onMutate);
@@ -3490,132 +3565,36 @@ const FEATURES = {
 
   /** Hide exhaustion banners and reset prompts without touching conversation content. */
   "hide-usage-alert"() {
-    const STYLE_ID = "codexpp-bennett-hide-usage-alert-style";
+    const STYLE_ID = "codex-plus-hide-usage-alert-style";
     const HIDDEN_ATTR = "data-codex-plus-hidden-usage-alert";
-    const THREAD_FOOTER_SELECTOR =
-      "[data-thread-scroll-footer='true'], [data-thread-find-composer='true'], [data-codex-composer-root], [data-pip-obstacle='thread-footer']";
-    const SCAN_SELECTOR =
-      "[role='alert'], [role='status'], [aria-live], header, section, aside, div";
-    const COMPOSER_SURFACE_SELECTOR =
-      "[data-codex-composer='true'], .composer-footer, .ProseMirror, textarea, input, [contenteditable='true'], [role='textbox']";
-    const quotaBannerRe =
-      /(你的\s*Codex\s*消息限额已用尽|Codex\s*消息限额已用尽|消息限额已用尽|message\s+limit|usage\s+limit|you['’]?re\s+out\s+of\s+Codex\s+messages|out\s+of\s+Codex\s+messages|你的\s*Codex\s*已用完|你的\s*Codex\s*消息\s*额度|你的\s*速率限制|速率限制\s*(?:将于|重置)|额度|限额|quota|rate\s+limit)/i;
-    const quotaResetRe =
-      /(额度将于|继续使用\s*Codex|升级至\s*Plus|quota\s+will\s+reset|limit\s+will\s+reset|rate\s+limit\s+resets|resets?\s+on|continue\s+using\s+Codex|start\s+your\s+free\s+trial\s+of\s+Plus|upgrade\s+to\s+plus|速率限制|将于\s*\d|重置|reset)/i;
-    const usageCardRe =
-      /(剩余\s*\d+%\s*使用量|重置频率|下次重置时间|remaining\s+\d+%\s+usage|usage\s+remaining|reset\s+frequency|next\s+reset)/i;
-    const actionTextRe =
-      /(升级|Plus|upgrade|pricing|plan|重置|reset|限额|额度|限制|limit|quota)/i;
+    const quotaRe = /(Codex\s*消息限额已用尽|消息限额已用尽|message\s+limit|usage\s+limit|out\s+of\s+Codex\s+messages|额度|限额|quota|rate\s+limit)/i;
+    const resetRe = /(额度将于|继续使用\s*Codex|升级至\s*Plus|quota\s+will\s+reset|limit\s+will\s+reset|rate\s+limit\s+resets|reset|重置|upgrade\s+to\s+plus)/i;
+    const usageCardRe = /(剩余\s*\d+%\s*使用量|remaining\s+\d+%\s+usage|usage\s+remaining|reset\s+frequency|next\s+reset)/i;
+    const actionRe = /(升级|Plus|upgrade|pricing|重置|reset|限额|额度|限制|limit|quota)/i;
     const hidden = new Set();
     let observer = null;
     let timer = 0;
 
-    const normalizeText = (value) => String(value || "").replace(/\s+/g, " ").trim();
-    const candidateText = (node) =>
-      node instanceof HTMLElement ? normalizeText(node.innerText || node.textContent || "") : "";
+    const textOf = (node) => String(node?.innerText || node?.textContent || "").replace(/\s+/g, " ").trim();
     const visibleBox = (node) => {
       if (!(node instanceof HTMLElement)) return false;
       const rect = node.getBoundingClientRect();
-      if (!rect || rect.width < 180 || rect.height < 16) return false;
-      if (rect.bottom <= 0 || rect.top >= (window.innerHeight || 900)) return false;
-      if (rect.right <= 0 || rect.left >= (window.innerWidth || 1200)) return false;
-      return true;
+      return rect.width >= 160 && rect.height >= 16 && rect.bottom > 0 && rect.top < (window.innerHeight || 900);
     };
-    const bannerBox = (node) => {
+    const hasAction = (node, text) => actionRe.test(`${text} ${Array.from(node.querySelectorAll("button, a, [role='button']")).slice(0, 8).map((item) => textOf(item)).join(" ")}`);
+    const hasEditable = (node) => Boolean(node.querySelector("input, textarea, [contenteditable='true'], [role='textbox']"));
+    const touchesUsageControl = (node) => Boolean(node.closest("[data-codexpp='usage-slot'], [data-codexpp='usage-box'], [data-codexpp='usage-boxes']"));
+    const shouldHide = (node) => {
+      if (!(node instanceof HTMLElement) || node.closest("[data-message-author-role], article")) return false;
+      if (!node.matches("[role='alert'], [role='status'], [aria-live]")) return false;
       if (!visibleBox(node)) return false;
-      const rect = node.getBoundingClientRect();
-      return rect.width >= 300 && rect.height >= 30 && rect.height <= 180;
-    };
-    const usageCardBox = (node) => {
-      if (!visibleBox(node)) return false;
-      const rect = node.getBoundingClientRect();
-      return rect.width >= 160 && rect.width <= 560 && rect.height >= 70 && rect.height <= 340;
-    };
-    const insideConversationContent = (node) =>
-      Boolean(
-        node.closest(
-          [
-            "[data-message-author-role]",
-            "[data-testid*='message' i]",
-            "[data-test-id*='message' i]",
-            "[data-thread-find-target]",
-            "article",
-          ].join(","),
-        ),
-      );
-    const hasAction = (node, text) => {
-      const actionableText = normalizeText(
-        Array.from(node.querySelectorAll("button, a, [role='button']"))
-          .slice(0, 8)
-          .map((item) => item.innerText || item.textContent || item.getAttribute("aria-label") || "")
-          .join(" "),
-      );
-      return actionTextRe.test(`${text} ${actionableText}`);
-    };
-    const hasEditable = (node) =>
-      Boolean(node.querySelector("input, textarea, [contenteditable='true'], [role='textbox']"));
-    const touchesComposerSurface = (node) => Boolean(node.closest(COMPOSER_SURFACE_SELECTOR));
-    const touchesUsageControl = (node) =>
-      Boolean(node.closest("[data-codexpp='usage-slot'], [data-codexpp='usage-box'], [data-codexpp='usage-boxes']"));
-    const looksLikeQuotaBanner = (node) => {
-      if (insideConversationContent(node) || !bannerBox(node)) return false;
-      if (hasEditable(node) || touchesUsageControl(node) || touchesComposerSurface(node)) return false;
-      const text = candidateText(node);
-      if (text.length < 20 || text.length > 420) return false;
-      if (!quotaBannerRe.test(text) || !quotaResetRe.test(text)) return false;
-      return hasAction(node, text);
-    };
-    const looksLikeUsageCard = (node) => {
-      if (insideConversationContent(node) || !usageCardBox(node)) return false;
-      if (hasEditable(node) || touchesUsageControl(node) || touchesComposerSurface(node)) return false;
-      const text = candidateText(node);
-      if (text.length < 20 || text.length > 300) return false;
-      if (!usageCardRe.test(text)) return false;
-      if (!/剩余\s*\d+%\s*使用量|remaining\s+\d+%\s+usage|usage\s+remaining/i.test(text)) return false;
-      return hasAction(node, text);
-    };
-    const quotaBannerRoot = (node) => {
-      const parent = node.parentElement;
-      if (!parent || parent === document.body) return node;
-      const text = candidateText(parent);
-      if (text.length <= 420 && quotaBannerRe.test(text) && quotaResetRe.test(text) && bannerBox(parent)) return parent;
-      return node;
-    };
-    const usageCardRoot = (node) => {
-      if (node.getAttribute("role") === "status" && looksLikeUsageCard(node)) return node;
-      const status = node.closest('[role="status"]');
-      if (status && looksLikeUsageCard(status)) return status;
-      const childStatus = node.querySelector('[role="status"]');
-      if (childStatus && looksLikeUsageCard(childStatus)) return childStatus;
-      return node;
-    };
-    const shouldHide = (node, allowGeneric = false) => {
-      if (!(node instanceof HTMLElement) || insideConversationContent(node)) return false;
-      if (node.matches(THREAD_FOOTER_SELECTOR)) return false;
-      if (
-        !node.matches(
-          allowGeneric
-            ? "aside, header, section, div, [role='alert'], [role='status'], [aria-live]"
-            : "[role='alert'], [role='status'], [aria-live]",
-        )
-      ) return false;
-      if (!visibleBox(node) || hasEditable(node) || touchesUsageControl(node) || touchesComposerSurface(node)) return false;
-      const text = candidateText(node);
+      if (hasEditable(node) || touchesUsageControl(node)) return false;
+      const text = textOf(node);
       if (text.length < 12 || text.length > 500) return false;
       const rect = node.getBoundingClientRect();
-      const bannerLike =
-        rect.width >= 300 && rect.height >= 30 && rect.height <= 240 && quotaBannerRe.test(text) && quotaResetRe.test(text);
-      const cardLike =
-        rect.width >= 160 && rect.width <= 560 && rect.height >= 70 && rect.height <= 340 && usageCardRe.test(text);
+      const bannerLike = rect.width >= 300 && rect.height >= 30 && rect.height <= 240 && quotaRe.test(text) && resetRe.test(text);
+      const cardLike = rect.width >= 160 && rect.width <= 560 && rect.height >= 70 && rect.height <= 340 && usageCardRe.test(text) && hasAction(node, text);
       return (bannerLike || cardLike) && hasAction(node, text);
-    };
-    const findAlertTarget = (root) => {
-      if (!(root instanceof HTMLElement)) return null;
-      const candidates = [root, ...root.querySelectorAll("aside, [role='alert'], [role='status'], [aria-live]")];
-      for (const candidate of candidates) {
-        if (candidate instanceof HTMLElement && shouldHide(candidate, candidate.matches("aside"))) return candidate;
-      }
-      return null;
     };
     const hide = (node) => {
       if (!(node instanceof HTMLElement) || node === document.body || node === document.documentElement) return;
@@ -3625,28 +3604,18 @@ const FEATURES = {
     const scan = () => {
       timer = 0;
       if (!document.body) return;
-      for (const node of document.body.querySelectorAll(SCAN_SELECTOR)) {
-        if (!(node instanceof HTMLElement) || node.getAttribute(HIDDEN_ATTR) === "true") continue;
-        if (node.matches(THREAD_FOOTER_SELECTOR)) {
-          const target = findAlertTarget(node);
-          if (target && target.getAttribute(HIDDEN_ATTR) !== "true") hide(target);
-          continue;
-        }
-        const generic = node.matches("aside, header, section, div");
-        if (looksLikeQuotaBanner(node) || looksLikeUsageCard(node) || shouldHide(node, generic)) hide(node);
+      for (const node of document.body.querySelectorAll('[role="alert"], [role="status"], [aria-live]')) {
+        if (!node.hasAttribute(HIDDEN_ATTR) && shouldHide(node)) hide(node);
       }
     };
-    const schedule = (delay = 80) => {
-      if (!timer) timer = window.setTimeout(scan, delay);
+    const schedule = () => {
+      if (!timer) timer = window.setTimeout(scan, 80);
     };
     const style = document.createElement("style");
     style.id = STYLE_ID;
     style.textContent = `[${HIDDEN_ATTR}="true"] { display: none !important; visibility: hidden !important; pointer-events: none !important; }`;
-    document.getElementById(STYLE_ID)?.remove();
     document.documentElement.appendChild(style);
-    observer = new MutationObserver((mutations) => {
-      if (mutations.some((mutation) => mutation.addedNodes.length || mutation.type === "characterData")) schedule();
-    });
+    observer = new MutationObserver(schedule);
     observer.observe(document.documentElement, { childList: true, subtree: true, characterData: true });
     scan();
 
@@ -3658,6 +3627,7 @@ const FEATURES = {
       hidden.clear();
     };
   },
+
   /**
    * Square sidebar: the visual "rounded sidebar" is actually the main
    * content panel — `<main class="main-surface ... rounded-s-2xl">` —
@@ -8183,14 +8153,6 @@ function writeSnapshot(api, snap) {
  * The returned element exposes `_refresh(snapshot)` so callers can update
  * values in place without unmount/remount.
  */
-function isApiSnapshot(snapshot) {
-  return Boolean(
-    snapshot?.apiMode === true ||
-      snapshot?.fiveHour?.apiMode === true ||
-      String(snapshot?.fiveHour?.label || "").trim().toUpperCase() === "API",
-  );
-}
-
 function renderUsageBox(api, snapshot) {
   const BASE_ORDER = ["5h", "weekly"];
   let order = [...BASE_ORDER];
@@ -8572,13 +8534,6 @@ function switchControl(initial, onChange) {
     panel.innerHTML = settingsPanelHtml();
     panel.addEventListener("click", (event) => {
       const target = event.target instanceof Element ? event.target : event.target?.parentElement;
-      const historyLoad = target?.closest("[data-bennett-ui-history-load]");
-      if (historyLoad) {
-        event.preventDefault();
-        event.stopPropagation();
-        void loadHistoryFromSettings(panel);
-        return;
-      }
       const toggle = target?.closest("[data-bennett-ui-feature]");
       if (!toggle) return;
       event.preventDefault();
@@ -8602,17 +8557,6 @@ function switchControl(initial, onChange) {
           <div class="bennett-ui-settings-note">切换会尽量立即生效。如果 Codex DOM 变动导致残留，可重新加载用户脚本或重启 Codex++。</div>
         </div>
       </div>
-      <div class="codex-plus-row bennett-ui-history-row" data-bennett-ui-history-row="true">
-        <div class="bennett-ui-history-copy">
-          <div class="codex-plus-row-title">会话历史加载</div>
-          <div class="codex-plus-row-description">设置 Codex 原生近期会话缓存的加载数量。插件只负责取回会话 ID，侧边栏由 Codex 自己渲染和虚拟滚动。范围 ${HISTORY_TARGET_MIN}–${HISTORY_TARGET_MAX} 条。</div>
-          <div class="bennett-ui-feature-status" data-bennett-ui-history-status="true">尚未手动加载</div>
-        </div>
-        <div class="bennett-ui-history-controls">
-          <input type="number" min="${HISTORY_TARGET_MIN}" max="${HISTORY_TARGET_MAX}" step="50" value="${readHistoryTarget()}" inputmode="numeric" aria-label="保留会话个数" data-bennett-ui-history-limit="true">
-          <button type="button" class="bennett-ui-history-load" data-bennett-ui-history-load="true">手动加载会话</button>
-        </div>
-      </div>
       ${featureInfo.map((item) => `
         <div class="codex-plus-row bennett-ui-feature-row" data-bennett-ui-row="${escapeAttr(item.id)}">
           <div>
@@ -8624,66 +8568,6 @@ function switchControl(initial, onChange) {
         </div>
       `).join("")}
     `;
-  }
-
-  function normalizeHistoryTarget(value) {
-    const parsed = Number.parseInt(String(value ?? ""), 10);
-    if (!Number.isFinite(parsed)) return HISTORY_TARGET_DEFAULT;
-    return Math.max(HISTORY_TARGET_MIN, Math.min(HISTORY_TARGET_MAX, parsed));
-  }
-
-  function readHistoryTarget() {
-    try {
-      return normalizeHistoryTarget(localStorage.getItem(HISTORY_TARGET_STORAGE_KEY));
-    } catch {
-      return HISTORY_TARGET_DEFAULT;
-    }
-  }
-
-  function writeHistoryTarget(value) {
-    const target = normalizeHistoryTarget(value);
-    try {
-      localStorage.setItem(HISTORY_TARGET_STORAGE_KEY, String(target));
-    } catch {}
-    return target;
-  }
-
-  async function loadHistoryFromSettings(panel) {
-    const input = panel.querySelector("[data-bennett-ui-history-limit]");
-    const button = panel.querySelector("[data-bennett-ui-history-load]");
-    const status = panel.querySelector("[data-bennett-ui-history-status]");
-    if (!(input instanceof HTMLInputElement) || !(button instanceof HTMLButtonElement)) return;
-
-    const limit = writeHistoryTarget(input.value);
-    input.value = String(limit);
-    button.disabled = true;
-    button.dataset.loading = "true";
-    if (status) status.textContent = `正在请求 Codex 原生加载，最多 ${limit} 条会话…`;
-
-    try {
-      const pagebuster = window.__codexListPagebuster || window.__bennettUiEmbeddedHistoryLoader;
-      if (!pagebuster || typeof pagebuster.refresh !== "function") {
-        throw new Error("Bennett 内置会话加载器尚未初始化，请重新加载用户脚本");
-      }
-      pagebuster.setLimit?.(limit);
-      const count = await pagebuster.refresh(limit);
-      pagebuster.render?.();
-      const info = pagebuster.status?.() || {};
-      const loaded = Number.isFinite(count) ? count : Number(info.snapshotThreads || 0);
-      if (info.lastSnapshotError) throw new Error(info.lastSnapshotError);
-      if (status) {
-        const cached = Number(info.nativeCachedThreads || info.nativeIdsRequested || loaded);
-        const missing = Number(info.nativeMissingThreads || 0);
-        status.textContent = missing > 0
-          ? `Codex 原生缓存已加载 ${cached} 条，仍有 ${missing} 条未能读取；当前窗口由系统虚拟渲染 ${Number(info.nativeThreads || 0)} 个节点。`
-          : `Codex 原生缓存已完整加载 ${cached} 条；当前窗口由系统虚拟渲染 ${Number(info.nativeThreads || 0)} 个节点。`;
-      }
-    } catch (error) {
-      if (status) status.textContent = `加载失败：${error?.message || String(error)}`;
-    } finally {
-      button.disabled = false;
-      delete button.dataset.loading;
-    }
   }
 
   function refreshSettingsPanel() {
@@ -8698,24 +8582,19 @@ function switchControl(initial, onChange) {
   }
 
   function ensureSettingsStyle() {
-    let style = document.getElementById("bennett-ui-settings-style");
-    if (!style) {
-      style = document.createElement("style");
-      style.id = "bennett-ui-settings-style";
-      document.head.appendChild(style);
-    }
+    if (document.getElementById("bennett-ui-settings-style")) return;
+    const style = document.createElement("style");
+    style.id = "bennett-ui-settings-style";
     style.textContent = `
       .bennett-ui-settings-note,
       .bennett-ui-feature-status {
         margin-top: 6px;
-        color: inherit;
-        opacity: .68;
+        color: var(--text-secondary, var(--color-token-text-secondary, #8b8b8b));
         font-size: 12px;
         line-height: 1.35;
       }
       .bennett-ui-feature-row[data-enabled="true"] .bennett-ui-feature-status {
-        color: inherit;
-        opacity: .9;
+        color: var(--text-primary, var(--color-token-text-primary, #f5f5f5));
       }
       .bennett-ui-toggle[disabled] {
         cursor: not-allowed;
@@ -8724,58 +8603,8 @@ function switchControl(initial, onChange) {
       .bennett-ui-toggle[data-enabled="true"] span {
         transform: translateX(14px);
       }
-      .bennett-ui-history-row {
-        align-items: center;
-        gap: 16px;
-      }
-      .bennett-ui-history-copy {
-        min-width: 0;
-      }
-      .bennett-ui-history-controls {
-        display: flex;
-        flex: 0 0 auto;
-        align-items: center;
-        gap: 8px;
-      }
-      .bennett-ui-history-controls input {
-        width: 92px;
-        border: 1px solid color-mix(in srgb, currentColor 22%, transparent);
-        border-radius: 7px;
-        background: color-mix(in srgb, currentColor 9%, transparent);
-        color: inherit;
-        caret-color: currentColor;
-        color-scheme: dark;
-        padding: 6px 8px;
-        font: inherit;
-      }
-      .bennett-ui-history-load {
-        border: 1px solid color-mix(in srgb, currentColor 22%, transparent);
-        border-radius: 7px;
-        background: color-mix(in srgb, currentColor 12%, transparent);
-        color: inherit;
-        padding: 6px 10px;
-        font: inherit;
-        cursor: pointer;
-      }
-      .bennett-ui-history-load:hover:not(:disabled) {
-        background: color-mix(in srgb, currentColor 18%, transparent);
-      }
-      .bennett-ui-history-load:disabled {
-        cursor: wait;
-        opacity: .6;
-      }
-      @media (max-width: 720px) {
-        .bennett-ui-history-row,
-        .bennett-ui-history-controls {
-          align-items: stretch;
-          flex-direction: column;
-        }
-        .bennett-ui-history-controls input {
-          width: 100%;
-          box-sizing: border-box;
-        }
-      }
     `;
+    document.head.appendChild(style);
   }
 
   function escapeHtmlLocal(value) {
@@ -8813,14 +8642,6 @@ function switchControl(initial, onChange) {
       if (typeof tweak.stop === "function") {
         tweak.stop.call(tweak);
       }
-      const embeddedLoader = window.__bennettUiEmbeddedHistoryLoader;
-      if (embeddedLoader && typeof embeddedLoader.stop === "function") {
-        embeddedLoader.stop();
-      }
-      if (window.__codexListPagebuster === embeddedLoader) {
-        delete window.__codexListPagebuster;
-      }
-      delete window.__bennettUiEmbeddedHistoryLoader;
     },
   };
 
@@ -8898,6 +8719,7 @@ function switchControl(initial, onChange) {
   const CLI_MAX_PAGES = Math.ceil(MAX_TARGET / CLI_PAGE_SIZE);
   const NATIVE_HYDRATE_BATCH_SIZE = 10;
   const NATIVE_MANAGER_SCAN_LIMIT = 150000;
+  const STARTUP_REFRESH_DELAYS_MS = [1800, 4000, 8000];
   const SCRIPT_KEY = "__codexListPagebuster";
   const STORAGE_KEY = "__codexListPagebusterThreads";
   const STORAGE_VERSION_KEY = "__codexListPagebusterStorageVersion";
@@ -8944,7 +8766,12 @@ function switchControl(initial, onChange) {
     nativeOriginalHistoryLimit: null,
     nativeHistoryLimitGetter: null,
     nativeHistoryLimit: DEFAULT_TARGET,
-    lastNativeLoadError: ""
+    lastNativeLoadError: "",
+    startupRefreshTimer: 0,
+    startupRefreshAttempts: 0,
+    startupRefreshCompleted: false,
+    startupRefreshCount: 0,
+    lastStartupRefreshError: ""
   };
 
   function normalizeTarget(value, fallback = DEFAULT_TARGET) {
@@ -9931,8 +9758,39 @@ function switchControl(initial, onChange) {
     renderSupplementalHistory();
   }
 
+  function scheduleStartupHistoryRefresh(attempt = 0) {
+    if (state.startupRefreshCompleted || attempt >= STARTUP_REFRESH_DELAYS_MS.length) return;
+    if (state.startupRefreshTimer) window.clearTimeout(state.startupRefreshTimer);
+    state.startupRefreshTimer = window.setTimeout(async () => {
+      state.startupRefreshTimer = 0;
+      state.startupRefreshAttempts = attempt + 1;
+      state.lastStartupRefreshError = "";
+      try {
+        const count = await refreshSnapshotFromCli(true, readTarget());
+        state.startupRefreshCount = Number.isFinite(count) ? count : readSnapshotThreads().length;
+        state.startupRefreshCompleted = true;
+        log("startup history refresh completed", {
+          attempt: state.startupRefreshAttempts,
+          count: state.startupRefreshCount,
+          nativeCachedThreads: state.nativeCachedThreads
+        });
+      } catch (error) {
+        state.lastStartupRefreshError = String(error);
+        log("startup history refresh failed", {
+          attempt: state.startupRefreshAttempts,
+          error: state.lastStartupRefreshError
+        });
+        scheduleStartupHistoryRefresh(attempt + 1);
+      }
+    }, STARTUP_REFRESH_DELAYS_MS[attempt]);
+  }
+
   function stop() {
     renderSupplementalHistory();
+    if (state.startupRefreshTimer) {
+      window.clearTimeout(state.startupRefreshTimer);
+      state.startupRefreshTimer = 0;
+    }
     if (
       state.nativeRuntimeSettings
       && state.nativeHistoryLimitGetter
@@ -9975,6 +9833,10 @@ function switchControl(initial, onChange) {
       nativeMissingThreads: state.nativeMissingThreads,
       nativeManagerFound: Boolean(state.nativeManager),
       lastNativeLoadError: state.lastNativeLoadError,
+      startupRefreshAttempts: state.startupRefreshAttempts,
+      startupRefreshCompleted: state.startupRefreshCompleted,
+      startupRefreshCount: state.startupRefreshCount,
+      lastStartupRefreshError: state.lastStartupRefreshError,
       configuredLimit: readTarget(),
       globalExtraHistory: GLOBAL_EXTRA_HISTORY,
       renderer: "codex-native",
@@ -9990,6 +9852,7 @@ function switchControl(initial, onChange) {
 
   renderSupplementalHistory();
   migrateStorageForGlobalHistory();
+  scheduleStartupHistoryRefresh();
   log("loaded", window[SCRIPT_KEY].status());
 })();
 /* END BENNETT EMBEDDED NATIVE HISTORY LOADER */

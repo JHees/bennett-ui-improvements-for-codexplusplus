@@ -4,7 +4,7 @@
 
 **专为 BigPizzaV3 Codex++ 打造的界面与工作流增强脚本。**
 
-[![Version](https://img.shields.io/badge/version-1.2.1-14b8a6)](https://github.com/JHees/bennett-ui-improvements-for-codexplusplus)
+[![Version](https://img.shields.io/badge/version-1.2.2-14b8a6)](https://github.com/JHees/bennett-ui-improvements-for-codexplusplus)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Runtime](https://img.shields.io/badge/runtime-Codex%2B%2B-111827)](https://github.com/BigPizzaV3/CodexPlusPlus)
 [![Mode](https://img.shields.io/badge/mode-renderer--only-7c3aed)](#兼容性)
@@ -23,7 +23,7 @@ Bennett UI Improvements 是适用于 [BigPizzaV3 Codex++](https://github.com/Big
 | --- | --- |
 | 侧栏 | 项目颜色与分组背景、紧凑动作网格、可选方角和斜杠菜单优化。 |
 | 额度 | 真实的 5 小时与 Weekly 额度、可选 Credit、重置时间提示和明确的 `API` 模式。 |
-| 历史会话 | 手动将 1–2000 条会话加载进 Codex 原生缓存，不创建插件侧栏行。 |
+| 历史会话 | 自动将 1–2000 条会话加载进 Codex 原生缓存，不创建插件侧栏行。 |
 | Markdown | KaTeX 公式、数学表格、图片、相对图片路径和公式源码查看。 |
 | 设置 | 独立 Bennett UI 设置页，集中管理功能开关和会话加载数量。 |
 | 降低干扰 | 隐藏额度耗尽及 Plus/Pro 推广提示，同时保留输入框和 Codex 软件更新提示。 |
@@ -61,23 +61,23 @@ Bennett UI 1.2.1 已经内置原生会话加载器，**不需要**再单独安�
 | 匹配设置页侧栏宽度 | 开启 | 稳定 |
 | 紧凑侧栏动作网格 | 开启 | 稳定 |
 | 斜杠菜单优化 | 开启 | 稳定 |
-| 原生会话历史加载 | 手动 | 稳定；可设置 1–2000 条 |
+| 原生会话历史加载 | 自动 | 每次启动加载；可设置 1–2000 条并手动重试 |
 | 侧栏方角 | 关闭 | 稳定 |
 
 所有功能开关和会话加载入口都位于 **Codex++ 管理工具 → Bennett UI 设置**。设置保存在本地，重新加载脚本不会覆盖用户选择。
 
 ## 原生会话历史加载
 
-1.2.1 已将原生历史加载器直接合并进 Bennett UI：
+内置的原生历史加载器支持：
 
 - 保留数量可设置为 **1–2000** 条，默认 **500** 条。
-- 只有点击 **手动加载会话** 时才执行，不在启动时扫描全部历史。
+- 每次打开 Codex 后自动加载一次；启动阶段失败时会有限重试，也可点击 **手动加载会话** 立即重试。
 - 合并 CLI 会话 ID 与 renderer 已知摘要，并按会话 ID 去重。
 - 缺失摘要通过 Codex 自身接口小批量补齐。
 - 侧栏渲染与虚拟滚动仍完全由 Codex 负责。
 - 不注入替代会话行、不拦截网络请求，也不使用全局 `MutationObserver` 持续扫描页面。
 
-如果旧环境仍启用了独立 Pagebuster，两个脚本会使用同一个全局入口并自动交接，只保留一个活动实例。确认 Bennett UI 1.2.1 工作正常后，可以卸载独立 Pagebuster。
+如果旧环境仍启用了独立 Pagebuster，两个脚本会使用同一个全局入口并自动交接，只保留一个活动实例。确认 Bennett UI 工作正常后，可以卸载独立 Pagebuster。
 
 启用 cc-switch 的“同步会话”后，Bennett 读取的是同一 `.codex` 存储的两种运行时视图——CLI 索引与 renderer 摘要，不会创建第二份会话数据库。
 
@@ -97,8 +97,8 @@ Bennett UI 1.2.1 已经内置原生会话加载器，**不需要**再单独安�
 - 行内与块级公式：`$...$`、`$$...$$`、`\(...\)` 和 `\[...\]`。
 - 使用 Codex 内置 KaTeX，不依赖外部数学公式 CDN。
 - Markdown 表格以及表格单元格中的数学内容。
-- 根据当前文档解析本地和相对图片路径。
-- 选择已渲染公式并查看对应 LaTeX 源码。
+- 根据当前文档解析本地和相对图片路径，并在图片接近视野时通过 Codex 原生媒体协议加载。
+- 公式、图片和数学表格单元格均支持原位编辑源码。
 
 ## 兼容性
 

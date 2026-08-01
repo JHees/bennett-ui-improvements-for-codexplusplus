@@ -11,6 +11,7 @@
   const CLI_MAX_PAGES = Math.ceil(MAX_TARGET / CLI_PAGE_SIZE);
   const NATIVE_HYDRATE_BATCH_SIZE = 10;
   const NATIVE_MANAGER_SCAN_LIMIT = 150000;
+  const STARTUP_REFRESH_DELAYS_MS = [1800, 4000, 8000];
   const SCRIPT_KEY = "__codexListPagebuster";
   const STORAGE_KEY = "__codexListPagebusterThreads";
   const STORAGE_VERSION_KEY = "__codexListPagebusterStorageVersion";
@@ -57,7 +58,12 @@
     nativeOriginalHistoryLimit: null,
     nativeHistoryLimitGetter: null,
     nativeHistoryLimit: DEFAULT_TARGET,
-    lastNativeLoadError: ""
+    lastNativeLoadError: "",
+    startupRefreshTimer: 0,
+    startupRefreshAttempts: 0,
+    startupRefreshCompleted: false,
+    startupRefreshCount: 0,
+    lastStartupRefreshError: ""
   };
 
   function normalizeTarget(value, fallback = DEFAULT_TARGET) {
@@ -1044,8 +1050,39 @@
     renderSupplementalHistory();
   }
 
+  function scheduleStartupHistoryRefresh(attempt = 0) {
+    if (state.startupRefreshCompleted || attempt >= STARTUP_REFRESH_DELAYS_MS.length) return;
+    if (state.startupRefreshTimer) window.clearTimeout(state.startupRefreshTimer);
+    state.startupRefreshTimer = window.setTimeout(async () => {
+      state.startupRefreshTimer = 0;
+      state.startupRefreshAttempts = attempt + 1;
+      state.lastStartupRefreshError = "";
+      try {
+        const count = await refreshSnapshotFromCli(true, readTarget());
+        state.startupRefreshCount = Number.isFinite(count) ? count : readSnapshotThreads().length;
+        state.startupRefreshCompleted = true;
+        log("startup history refresh completed", {
+          attempt: state.startupRefreshAttempts,
+          count: state.startupRefreshCount,
+          nativeCachedThreads: state.nativeCachedThreads
+        });
+      } catch (error) {
+        state.lastStartupRefreshError = String(error);
+        log("startup history refresh failed", {
+          attempt: state.startupRefreshAttempts,
+          error: state.lastStartupRefreshError
+        });
+        scheduleStartupHistoryRefresh(attempt + 1);
+      }
+    }, STARTUP_REFRESH_DELAYS_MS[attempt]);
+  }
+
   function stop() {
     renderSupplementalHistory();
+    if (state.startupRefreshTimer) {
+      window.clearTimeout(state.startupRefreshTimer);
+      state.startupRefreshTimer = 0;
+    }
     if (
       state.nativeRuntimeSettings
       && state.nativeHistoryLimitGetter
@@ -1088,6 +1125,10 @@
       nativeMissingThreads: state.nativeMissingThreads,
       nativeManagerFound: Boolean(state.nativeManager),
       lastNativeLoadError: state.lastNativeLoadError,
+      startupRefreshAttempts: state.startupRefreshAttempts,
+      startupRefreshCompleted: state.startupRefreshCompleted,
+      startupRefreshCount: state.startupRefreshCount,
+      lastStartupRefreshError: state.lastStartupRefreshError,
       configuredLimit: readTarget(),
       globalExtraHistory: GLOBAL_EXTRA_HISTORY,
       renderer: "codex-native",
@@ -1103,5 +1144,6 @@
 
   renderSupplementalHistory();
   migrateStorageForGlobalHistory();
+  scheduleStartupHistoryRefresh();
   log("loaded", window[SCRIPT_KEY].status());
 })();

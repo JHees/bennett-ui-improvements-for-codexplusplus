@@ -656,7 +656,7 @@ $prefix = @'
   "use strict";
 
   const INSTALL_KEY = "__bennettUiImprovementsBigPizza";
-  const VERSION = "1.2.1";
+  const VERSION = "1.2.2";
   const previous = window[INSTALL_KEY];
   if (previous && typeof previous.stop === "function") {
     try {
