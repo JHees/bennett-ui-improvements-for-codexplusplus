@@ -1,147 +1,172 @@
-# Bennett UI Improvements for BigPizzaV3 Codex++
+<div align="center">
 
-Bennett UI Improvements 是适用于 [BigPizzaV3 Codex++](https://github.com/BigPizzaV3/CodexPlusPlus) 的 renderer-only 用户脚本。它将原始的 [b-nnett/codex-plusplus-bennett-ui](https://github.com/b-nnett/codex-plusplus-bennett-ui) 迁移到 BigPizzaV3 Codex++ 的用户脚本运行时，并保留原项目来源、作者和 MIT 许可声明。
+# Bennett UI Improvements for Codex++
 
-本项目的维护者和迁移适配作者是 [JHees](https://github.com/JHees)；这不是对原 Bennett UI 项目的重新署名或原创替代。
+**A focused UI and workflow upgrade for BigPizzaV3 Codex++.**
 
-## 亮点
+[![Version](https://img.shields.io/badge/version-1.2.0-14b8a6)](https://github.com/JHees/bennett-ui-improvements-for-codexplusplus)
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Runtime](https://img.shields.io/badge/runtime-Codex%2B%2B-111827)](https://github.com/BigPizzaV3/CodexPlusPlus)
+[![Mode](https://img.shields.io/badge/mode-renderer--only-7c3aed)](#compatibility)
 
-- **彩色项目管理界面**：为侧栏项目提供分组背景和颜色区分，让项目列表更容易扫描、定位和管理。
-- **5 小时 / Weekly / Credit 额度显示**：左下角默认显示 5 小时额度，点击控件可切换 Weekly；只有实际获取到点数数据时才显示 Credit；API 登录模式直接显示 `API`，不会伪造官方额度。
-- **额度到期时间**：5 小时和 Weekly 模式悬停时显示重置时间；Credit 模式显示点数本身，不用重置时间覆盖。
-- **额度提示隐藏**：隐藏额度耗尽弹窗、重置提示和额度卡片，同时保留输入框和会话内容。额度提示隐藏功能已经合并进本插件，不需要额外安装 `market-hide-usage-alert.js`。
-- **原生会话历史加载**：在 Bennett UI 设置中自定义保留数量并手动加载历史会话，由 Codex 原生会话管理器缓存、渲染和虚拟滚动，避免额外 DOM 行与全页面监听造成卡顿。
-- **Markdown 预览公式显示**：在右侧 Markdown 文件预览中使用 Codex 内置 KaTeX 渲染 `$...$`、`$$...$$`、`\(...\\)` 和 `\[...\\]` 公式，并支持数学表格、图片预览和选中公式查看 LaTeX 源码。
-- **独立中文设置页**：在 `Codex++ 管理工具 -> Bennett UI 设置` 中逐项启用或关闭功能，不需要手动修改脚本源码。
+**English** · [简体中文](README.zh-CN.md)
 
-## 功能清单
+</div>
 
-| 功能 | 默认状态 | 说明 |
-| --- | --- | --- |
-| 项目背景和颜色 | 开启 | 为侧栏项目增加分组背景和颜色区分。 |
-| 5 小时 / Weekly / Credit 额度 | 开启 | 默认显示 5 小时，点击切换 Weekly；只有真实点数数据存在时显示 Credit；API 模式显示 `API`。 |
-| 隐藏额度耗尽提示 | 开启 | 隐藏额度耗尽横幅、重置提示和额度卡片，不隐藏输入框。 |
-| 隐藏套餐升级提示 | 开启 | 隐藏 Plus/Pro 套餐的 Upgrade / Get Plus 提示；不把普通 Codex 软件更新提示当作套餐升级提示处理。 |
-| Markdown 预览数学公式 | 开启 | 在右侧 `.md` / `.markdown` 预览中渲染 LaTeX 公式、数学表格和图片。 |
-| 设置搜索 | 开启 | 在 Codex 设置页增加搜索框。 |
-| 匹配设置页侧栏宽度 | 开启 | 让设置页侧栏宽度与主侧栏保持一致。 |
-| 侧栏动作网格 | 开启 | 将新建任务、搜索、插件和自动化入口整理为紧凑网格。 |
-| 斜杠菜单优化 | 开启 | 调整斜杠菜单行距、分组标题和选中状态。 |
-| 跨账号会话刷新 | 开启 | 登录或切换账号后刷新云端会话列表；需要当前 provider 支持账号级历史会话查询。 |
-| 会话历史手动加载 | 按需 | 自定义保留 1–2000 条会话并写入 Codex 原生近期会话缓存；需要同时启用 `Codex List Pagebuster`。 |
-| 侧栏方角 | 关闭 | 去除侧栏与主内容连接处的圆角。 |
-| 侧栏会话多选 | 关闭 | 使用 `Cmd/Ctrl + 单击` 选择多个会话，并通过右键菜单执行批量操作。 |
-| 消息 token 指标 | 关闭（不支持） | 旧实现依赖 main process 读取本地 Codex JSONL，BigPizzaV3 renderer-only 用户脚本无法访问该层。 |
-| 固定会话项目名 | 关闭（不支持） | 旧实现依赖 main process 扫描本地会话文件。 |
-功能开关和会话历史加载入口都位于 `Bennett UI 设置` 页面。旧设置及历史会话保留数量会保存在本地，重新加载脚本时不会覆盖用户选择。
+Bennett UI Improvements is a renderer-only user script for [BigPizzaV3 Codex++](https://github.com/BigPizzaV3/CodexPlusPlus). It brings project-aware sidebar styling, reliable quota display, an enhanced Markdown preview, native conversation-history loading, and a dedicated settings panel into one installable script.
 
-## 原生会话历史加载
+This project adapts [b-nnett/codex-plusplus-bennett-ui](https://github.com/b-nnett/codex-plusplus-bennett-ui) to the BigPizzaV3 user-script runtime while preserving the original authorship and MIT license notices. The migration is maintained by [JHees](https://github.com/JHees).
 
-会话历史加载由两个脚本协作完成：Bennett UI 提供设置入口，`Codex List Pagebuster` 负责调用 Codex 原生会话管理器。因此需要先从 Script Market 安装并启用这两个脚本。
+## Highlights
 
-- 可输入保留数量，范围为 1–2000 条，默认 500 条。
-- 只在点击“手动加载会话”时执行，不会在启动时自动扫描全部历史。
-- 会合并 Codex CLI 会话索引与当前 renderer 已知摘要，并按会话 ID 去重。
-- 缺失摘要会分批交给 Codex 原生接口读取；侧栏仍由 Codex 自己渲染和虚拟滚动。
-- 不注入补充会话行，不拦截请求，也不使用持续的全页面 `MutationObserver` 扫描侧栏。
+| Area | What it adds |
+| --- | --- |
+| Sidebar | Project colors and backgrounds, compact action grid, optional square corners, and slash-menu polish. |
+| Usage | Real 5-hour and weekly quota data, optional Credit view, reset-time tooltips, and explicit `API` mode. |
+| History | Manually load 1–2000 conversations into Codex's native cache without custom sidebar rows. |
+| Markdown | KaTeX formulas, math tables, images, relative image paths, and source inspection in `.md` previews. |
+| Settings | A dedicated Bennett UI panel with per-feature switches and a native-history load control. |
+| Noise reduction | Hides quota-exhaustion and Plus/Pro upsell surfaces while preserving the composer and app-update notices. |
 
-如果使用 cc-switch 的“同步会话”，实际会话仍保存在统一的 `.codex` 目录；这里合并的是同一存储在运行时中的两种索引视图，不会创建第二份会话库。
+## Install
 
-## 额度数据规则
+### Codex++ Script Market
 
-- 插件启动时不会直接显示上一次保存的旧额度快照。
-- 只有当前页面或 Codex renderer bridge 返回新数据后，额度控件才会更新。
-- 5 小时和 Weekly 额度显示剩余百分比，并在悬停时显示重置时间。
-- Credit 只有在实际拿到点数数据时才出现；拿不到点数时不会显示虚假的 Credit。
-- 检测到 API 登录或纯 API provider 时显示 `API`，不会请求或推测 ChatGPT 官方额度。
-- 如果独立安装过 `market-hide-usage-alert.js`，建议删除它，因为额度耗尽提示隐藏功能已经合并到本插件。
+1. Open **Codex++ Management Tools**.
+2. Find and install **Bennett UI Improvements**.
+3. Enable the script and select **Reload user scripts**.
 
-## 运行时兼容性
+The native history loader is bundled into Bennett UI 1.2.0. You do **not** need to install Codex List Pagebuster separately.
 
-本插件运行在 BigPizzaV3 Codex++ 的 renderer-only 用户脚本环境中，因此可以稳定运行的功能主要集中在 DOM、设置页和 renderer bridge：
+### Manual installation
 
-- **稳定支持**：项目着色、额度显示、额度耗尽提示隐藏、Markdown 预览公式/表格/图片、设置搜索、设置页侧栏宽度、侧栏动作网格、斜杠菜单优化、套餐升级提示隐藏、跨账号会话刷新，以及配合 Pagebuster 的原生会话历史手动加载。
-- **部分支持**：侧栏会话多选可以显示和选择，但批量 Pin、Archive、mini window 等旧 Electron IPC 操作不可用，因此默认关闭。
-- **当前不支持**：消息 token 指标和固定会话项目名。这些功能需要 main process 读取本地会话文件，已在设置页标记为不可用。
-
-本插件不会修改 Codex 官方安装文件，也不会伪造 API 模式下的官方额度数据。
-## 安装
-
-### 从 Codex++ Script Market 安装
-
-在 Codex++ 管理工具中搜索并安装 **Bennett UI Improvements**，然后重新加载用户脚本。
-
-若要使用会话历史手动加载，还需安装并启用 **Codex List Pagebuster**。
-
-### 手动安装
-
-将以下文件复制到 Codex++ 用户脚本目录：
-
-```text
-scripts\bennett-ui-improvements.js
-```
-
-Windows 用户脚本目录：
+Copy [`scripts/bennett-ui-improvements.js`](scripts/bennett-ui-improvements.js) to:
 
 ```text
 %APPDATA%\Codex++\user_scripts\
 ```
 
-复制完成后，在 Codex++ 管理工具中启用脚本，并点击“重新加载用户脚本”。通常不需要重启 Codex。
+Enable the script in Codex++ and reload user scripts. A full Codex restart is normally unnecessary.
 
-## 可选附加脚本
+## Features
 
-仓库中的 `scripts/hidden-user-message-visibility-fix.js` 是独立的用户消息显示修复脚本，不属于 Bennett UI 主插件。它用于恢复会话压缩或 steering 渲染异常造成的用户消息隐藏。
+| Feature | Default | Support |
+| --- | ---: | --- |
+| Project backgrounds and colors | On | Stable |
+| 5-hour / Weekly / Credit usage | On | Stable when the current page exposes usage data |
+| Hide quota-exhaustion prompts | On | Stable |
+| Hide Plus/Pro upgrade prompts | On | Stable; Codex app-update notices remain visible |
+| Enhanced Markdown preview | On | Stable for `.md` and `.markdown` previews |
+| Settings search | On | Stable |
+| Match settings-sidebar width | On | Stable |
+| Compact sidebar action grid | On | Stable |
+| Slash-menu polish | On | Stable |
+| Cross-account history refresh | On | Provider-dependent |
+| Native conversation-history load | Manual | Stable; configurable from 1 to 2000 conversations |
+| Square sidebar corners | Off | Stable |
+| Multi-select sidebar conversations | Off | Partial; legacy batch IPC actions are unavailable |
+| Message token metrics | Off | Unsupported in the renderer-only runtime |
+| Pinned-conversation project names | Off | Unsupported in the renderer-only runtime |
 
-## 调试接口
+Feature switches and the history loader are available under **Codex++ Management Tools → Bennett UI Settings**. Preferences are stored locally and survive script reloads.
+
+## Native conversation history
+
+Version 1.2.0 embeds the native history loader directly in Bennett UI:
+
+- Choose a retention target from **1–2000** conversations; the default is **500**.
+- Loading starts only when you select **Load conversations manually**.
+- CLI conversation IDs and renderer-known summaries are merged and deduplicated by conversation ID.
+- Missing summaries are hydrated in small batches through Codex's own interfaces.
+- Codex remains responsible for sidebar rendering and virtual scrolling.
+- The loader does not inject replacement conversation rows, intercept network requests, or continuously scan the page with a global `MutationObserver`.
+
+If a standalone Pagebuster installation is still enabled, both scripts use the same global entry point and hand off to a single active instance. Once Bennett UI 1.2.0 is working, the standalone Pagebuster script can be removed.
+
+When cc-switch unified session history is enabled, Bennett reads two runtime views of the same `.codex` store—the CLI index and renderer summaries. It does not create a second conversation database.
+
+## Usage-data behavior
+
+- Saved quota snapshots are not presented as fresh data after startup.
+- The widget updates only after receiving current renderer or `/wham/usage` data.
+- Five-hour and weekly views show remaining percentage and reset-time tooltips.
+- Credit appears only when actual credit data is available.
+- API or pure-API providers show `API`; Bennett does not fabricate ChatGPT quota values.
+- The standalone `market-hide-usage-alert.js` script is no longer needed because that behavior is built in.
+
+## Markdown preview
+
+The right-side Markdown preview supports:
+
+- Inline and display math: `$...$`, `$$...$$`, `\(...\)`, and `\[...\]`.
+- Codex's bundled KaTeX renderer—no external math CDN is required.
+- Markdown tables, including math content inside cells.
+- Local and relative image paths resolved from the current document.
+- Selecting rendered math to inspect its LaTeX source.
+
+## Compatibility
+
+Bennett UI runs entirely in the BigPizzaV3 renderer user-script environment.
+
+| Capability | Status |
+| --- | --- |
+| DOM, CSS, settings UI, and renderer bridge features | Supported |
+| Native conversation-manager integration | Supported |
+| Legacy main-process filesystem access | Not available |
+| Legacy Electron IPC batch actions | Partially available or unavailable |
+| Modification of official Codex installation files | Never performed |
+
+DOM-dependent features may need updates after major Codex UI changes. Reloading user scripts is the first troubleshooting step.
+
+## Optional companion script
+
+[`scripts/hidden-user-message-visibility-fix.js`](scripts/hidden-user-message-visibility-fix.js) is an independent compatibility fix for user messages hidden by conversation compaction or steering-rendering issues. It is not part of the Bennett UI core script.
+
+## Debugging
 
 ```js
-// 查看当前插件实例
+// Bennett UI instance and feature controls
 window.__bennettUiImprovementsBigPizza
+window.__bennettUiImprovementsBigPizza.setFeature("sidebar-action-grid", false)
+window.__bennettUiImprovementsBigPizza.setFeature("render-markdown-preview-math", true)
 
-// 手动开关功能
-window.__bennettUiImprovementsBigPizza.setFeature("sidebar-action-grid", false);
-window.__bennettUiImprovementsBigPizza.setFeature("sidebar-action-grid", true);
-window.__bennettUiImprovementsBigPizza.setFeature("render-markdown-preview-math", true);
+// Markdown preview diagnostics
+window.__bennettMarkdownPreviewMath?.getStats()
 
-// 查看 Markdown 公式预览状态
-window.__bennettMarkdownPreviewMath?.getStats();
-
-// 查看原生会话加载状态（需要 Codex List Pagebuster）
-window.__codexListPagebuster?.status();
+// Embedded native-history loader diagnostics
+window.__bennettUiEmbeddedHistoryLoader?.status()
+window.__codexListPagebuster?.status()
 ```
 
-## 构建
+## Release packaging
+
+The release artifact is a single JavaScript file. After changing the embedded loader source, run:
 
 ```powershell
-.\tools\build-migrated-script.ps1
+.\tools\embed-native-history.ps1
 ```
 
-构建脚本读取：
+The packager removes an existing embedded block before appending the current [`features/native-history-loader.js`](features/native-history-loader.js), so repeated runs are deterministic. It writes the result to [`scripts/bennett-ui-improvements.js`](scripts/bennett-ui-improvements.js).
 
-- `old-bennett-ui/index.js`：原始 Bennett UI 实现和来源代码。
-- `features/markdown-preview-math.js`：Markdown 预览公式功能。
+`tools/build-migrated-script.ps1` is retained for rebuilding the historical Bennett migration baseline; it is not the one-step release pipeline for the current artifact.
 
-构建结果写入：
+## Repository layout
 
-```text
-scripts\bennett-ui-improvements.js
-```
+| Path | Purpose |
+| --- | --- |
+| `scripts/bennett-ui-improvements.js` | Installable single-file release artifact |
+| `features/native-history-loader.js` | Embedded native conversation-history loader source |
+| `features/markdown-preview-math.js` | Markdown preview enhancement source |
+| `scripts/hidden-user-message-visibility-fix.js` | Optional independent compatibility script |
+| `tools/embed-native-history.ps1` | Idempotent release packager |
+| `market-entry.json` | Codex++ Script Market metadata |
+| `NOTICE.md` | Upstream attribution and license notices |
 
-## 项目文件
+## Credits and license
 
-- `scripts/bennett-ui-improvements.js`：可直接安装的 BigPizzaV3 Codex++ 用户脚本。
-- `features/markdown-preview-math.js`：Markdown 预览数学公式功能。
-- `scripts/hidden-user-message-visibility-fix.js`：可选的用户消息显示修复脚本。
-- `tools/build-migrated-script.ps1`：单文件用户脚本构建工具。
-- `market-entry.json`：Codex++ Script Market 元数据。
-- `NOTICE.md`：原项目来源与许可证说明。
+- Original project: [b-nnett/codex-plusplus-bennett-ui](https://github.com/b-nnett/codex-plusplus-bennett-ui)
+- Target runtime: [BigPizzaV3/CodexPlusPlus](https://github.com/BigPizzaV3/CodexPlusPlus)
+- Script Market: [BigPizzaV3/CodexPlusPlusScriptMarket](https://github.com/BigPizzaV3/CodexPlusPlusScriptMarket)
+- Migration repository: [JHees/bennett-ui-improvements-for-codexplusplus](https://github.com/JHees/bennett-ui-improvements-for-codexplusplus)
 
-## 来源与许可
-
-- 原始 Bennett UI 项目：[b-nnett/codex-plusplus-bennett-ui](https://github.com/b-nnett/codex-plusplus-bennett-ui)
-- 运行时目标：[BigPizzaV3/CodexPlusPlus](https://github.com/BigPizzaV3/CodexPlusPlus)
-- 官方脚本市场：[BigPizzaV3/CodexPlusPlusScriptMarket](https://github.com/BigPizzaV3/CodexPlusPlusScriptMarket)
-- 迁移维护仓库：[JHees/bennett-ui-improvements-for-codexplusplus](https://github.com/JHees/bennett-ui-improvements-for-codexplusplus)
-
-本项目使用 MIT License。原始项目的版权、来源和许可证声明保留在脚本及 `NOTICE.md` 中。
+Released under the [MIT License](LICENSE). Original copyright, attribution, and permission notices are preserved in the distributed script and [`NOTICE.md`](NOTICE.md).
