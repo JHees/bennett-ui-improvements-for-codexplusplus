@@ -10,6 +10,7 @@ Bennett UI Improvements 是适用于 [BigPizzaV3 Codex++](https://github.com/Big
 - **5 小时 / Weekly / Credit 额度显示**：左下角默认显示 5 小时额度，点击控件可切换 Weekly；只有实际获取到点数数据时才显示 Credit；API 登录模式直接显示 `API`，不会伪造官方额度。
 - **额度到期时间**：5 小时和 Weekly 模式悬停时显示重置时间；Credit 模式显示点数本身，不用重置时间覆盖。
 - **额度提示隐藏**：隐藏额度耗尽弹窗、重置提示和额度卡片，同时保留输入框和会话内容。额度提示隐藏功能已经合并进本插件，不需要额外安装 `market-hide-usage-alert.js`。
+- **原生会话历史加载**：在 Bennett UI 设置中自定义保留数量并手动加载历史会话，由 Codex 原生会话管理器缓存、渲染和虚拟滚动，避免额外 DOM 行与全页面监听造成卡顿。
 - **Markdown 预览公式显示**：在右侧 Markdown 文件预览中使用 Codex 内置 KaTeX 渲染 `$...$`、`$$...$$`、`\(...\\)` 和 `\[...\\]` 公式，并支持数学表格、图片预览和选中公式查看 LaTeX 源码。
 - **独立中文设置页**：在 `Codex++ 管理工具 -> Bennett UI 设置` 中逐项启用或关闭功能，不需要手动修改脚本源码。
 
@@ -27,11 +28,24 @@ Bennett UI Improvements 是适用于 [BigPizzaV3 Codex++](https://github.com/Big
 | 侧栏动作网格 | 开启 | 将新建任务、搜索、插件和自动化入口整理为紧凑网格。 |
 | 斜杠菜单优化 | 开启 | 调整斜杠菜单行距、分组标题和选中状态。 |
 | 跨账号会话刷新 | 开启 | 登录或切换账号后刷新云端会话列表；需要当前 provider 支持账号级历史会话查询。 |
+| 会话历史手动加载 | 按需 | 自定义保留 1–2000 条会话并写入 Codex 原生近期会话缓存；需要同时启用 `Codex List Pagebuster`。 |
 | 侧栏方角 | 关闭 | 去除侧栏与主内容连接处的圆角。 |
 | 侧栏会话多选 | 关闭 | 使用 `Cmd/Ctrl + 单击` 选择多个会话，并通过右键菜单执行批量操作。 |
 | 消息 token 指标 | 关闭（不支持） | 旧实现依赖 main process 读取本地 Codex JSONL，BigPizzaV3 renderer-only 用户脚本无法访问该层。 |
 | 固定会话项目名 | 关闭（不支持） | 旧实现依赖 main process 扫描本地会话文件。 |
-所有功能都可以在 `Bennett UI 设置` 页面中单独开关。旧设置会保存在 Codex++ 用户脚本设置中，重新加载脚本时不会覆盖用户选择。
+功能开关和会话历史加载入口都位于 `Bennett UI 设置` 页面。旧设置及历史会话保留数量会保存在本地，重新加载脚本时不会覆盖用户选择。
+
+## 原生会话历史加载
+
+会话历史加载由两个脚本协作完成：Bennett UI 提供设置入口，`Codex List Pagebuster` 负责调用 Codex 原生会话管理器。因此需要先从 Script Market 安装并启用这两个脚本。
+
+- 可输入保留数量，范围为 1–2000 条，默认 500 条。
+- 只在点击“手动加载会话”时执行，不会在启动时自动扫描全部历史。
+- 会合并 Codex CLI 会话索引与当前 renderer 已知摘要，并按会话 ID 去重。
+- 缺失摘要会分批交给 Codex 原生接口读取；侧栏仍由 Codex 自己渲染和虚拟滚动。
+- 不注入补充会话行，不拦截请求，也不使用持续的全页面 `MutationObserver` 扫描侧栏。
+
+如果使用 cc-switch 的“同步会话”，实际会话仍保存在统一的 `.codex` 目录；这里合并的是同一存储在运行时中的两种索引视图，不会创建第二份会话库。
 
 ## 额度数据规则
 
@@ -46,7 +60,7 @@ Bennett UI Improvements 是适用于 [BigPizzaV3 Codex++](https://github.com/Big
 
 本插件运行在 BigPizzaV3 Codex++ 的 renderer-only 用户脚本环境中，因此可以稳定运行的功能主要集中在 DOM、设置页和 renderer bridge：
 
-- **稳定支持**：项目着色、额度显示、额度耗尽提示隐藏、Markdown 预览公式/表格/图片、设置搜索、设置页侧栏宽度、侧栏动作网格、斜杠菜单优化、套餐升级提示隐藏和跨账号会话刷新。
+- **稳定支持**：项目着色、额度显示、额度耗尽提示隐藏、Markdown 预览公式/表格/图片、设置搜索、设置页侧栏宽度、侧栏动作网格、斜杠菜单优化、套餐升级提示隐藏、跨账号会话刷新，以及配合 Pagebuster 的原生会话历史手动加载。
 - **部分支持**：侧栏会话多选可以显示和选择，但批量 Pin、Archive、mini window 等旧 Electron IPC 操作不可用，因此默认关闭。
 - **当前不支持**：消息 token 指标和固定会话项目名。这些功能需要 main process 读取本地会话文件，已在设置页标记为不可用。
 
@@ -56,6 +70,8 @@ Bennett UI Improvements 是适用于 [BigPizzaV3 Codex++](https://github.com/Big
 ### 从 Codex++ Script Market 安装
 
 在 Codex++ 管理工具中搜索并安装 **Bennett UI Improvements**，然后重新加载用户脚本。
+
+若要使用会话历史手动加载，还需安装并启用 **Codex List Pagebuster**。
 
 ### 手动安装
 
@@ -90,6 +106,9 @@ window.__bennettUiImprovementsBigPizza.setFeature("render-markdown-preview-math"
 
 // 查看 Markdown 公式预览状态
 window.__bennettMarkdownPreviewMath?.getStats();
+
+// 查看原生会话加载状态（需要 Codex List Pagebuster）
+window.__codexListPagebuster?.status();
 ```
 
 ## 构建

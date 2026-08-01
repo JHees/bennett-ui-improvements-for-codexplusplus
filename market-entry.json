@@ -1,8 +1,8 @@
 {
   "id": "bennett-ui-improvements",
   "name": "Bennett UI Improvements",
-  "description": "将 b-nnett 版 Bennett UI Improvements 迁移为 BigPizzaV3 Codex++ renderer-only 用户脚本，包含彩色侧栏/项目管理、5 小时/Weekly/Credit 额度显示、稳定的额度耗尽提示隐藏、右侧 Markdown 文件预览公式/表格/图片渲染，以及登录切换后的云端会话刷新。",
-  "version": "1.0.23-bigpizza.9",
+  "description": "将 b-nnett 版 Bennett UI Improvements 迁移为 BigPizzaV3 Codex++ renderer-only 用户脚本，包含彩色侧栏/项目管理、额度显示与提示隐藏、Markdown 预览增强，以及配合 Codex List Pagebuster 的原生会话历史手动加载。",
+  "version": "1.0.24-bigpizza.4",
   "author": "bennett; JHees",
   "tags": [
     "codex",
@@ -16,5 +16,5 @@
   ],
   "homepage": "https://github.com/JHees/bennett-ui-improvements-for-codexplusplus",
   "script_url": "https://raw.githubusercontent.com/BigPizzaV3/CodexPlusPlusScriptMarket/main/scripts/bennett-ui-improvements.js",
-  "sha256": "7c30e0d84a264c51af6e71d9cc2663113f5f53031cdc4820250f91931c71a7d4"
+  "sha256": "3049c5621021f29e8ef575e3e8674be662a249ee6f6cd20d5a045656ace6fb33"
 }
