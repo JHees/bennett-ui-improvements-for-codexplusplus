@@ -21,7 +21,43 @@
   "use strict";
 
   const INSTALL_KEY = "__bennettUiImprovementsBigPizza";
-  const VERSION = "1.0.23-bigpizza.9";
+  const VERSION = "1.2.4";
+  const HISTORY_TARGET_STORAGE_KEY = "__codexListPagebusterTarget";
+  const HISTORY_TARGET_DEFAULT = 500;
+  const HISTORY_TARGET_MIN = 1;
+  const HISTORY_TARGET_MAX = 2000;
+  const SCRIPT_LOAD_ID = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const lifecycleTimers = new Set();
+  const lifecycleSignatures = new Set();
+
+  function reportLifecycle(event, detail = {}) {
+    const signature = `${event}:${JSON.stringify(detail)}`;
+    if (event === "usage-mounted" && lifecycleSignatures.has(signature)) return;
+    lifecycleSignatures.add(signature);
+    const payload = {
+      event: `bennett-ui.${event}`,
+      version: VERSION,
+      scriptLoadId: SCRIPT_LOAD_ID,
+      ...detail,
+    };
+    window.__bennettUiLastLifecycle = payload;
+    try {
+      const bridge = window.__codexSessionDeleteBridge;
+      if (typeof bridge === "function") {
+        Promise.resolve(bridge("/diagnostics/log", payload)).catch(() => {});
+      }
+    } catch (_) {}
+  }
+
+  function scheduleLifecycle(callback, delay) {
+    const timer = window.setTimeout(() => {
+      lifecycleTimers.delete(timer);
+      callback();
+    }, delay);
+    lifecycleTimers.add(timer);
+    return timer;
+  }
+
   const previous = window[INSTALL_KEY];
   if (previous && typeof previous.stop === "function") {
     try {
@@ -61,18 +97,12 @@
  *                          grid of filled buttons.
  *  • sidebar-project-backgrounds  Add subtle grouped backgrounds behind
  *                                 project rows in the main sidebar.
- *  • sidebar-chat-multi-select  Cmd/Ctrl-click sidebar chats to select
- *                               multiple rows and run batch actions.
- *  • show-pinned-chat-project-names  Shows a small project name under
- *                                    pinned sidebar chats.
- *  • show-message-metrics-on-hover  Shows Codex token metrics beside
- *                                   assistant messages on hover.
  *  • slash-menu-polish  Tightens the composer slash menu with denser rows,
  *                       clearer active state, and calmer section headers.
  *
  * Authoring notes
  * ---------------
- *  • Renderer + main; main reads local Codex session JSONL for metrics.
+ *  • Renderer-first implementation with reversible feature cleanup.
  *  • Each feature returns a `dispose()` so toggling off is clean.
  *  • Match-by-text-content for resilience: Codex's main shell has no
  *    stable testids/aria-labels for these widgets.
@@ -82,10 +112,7 @@
 module.exports = {
   start(api) {
     if (api.process === "main") {
-      startMainMetricsProvider(api);
       startMainUsageProvider(api);
-      startMainProjectLabelProvider(api);
-      startMainSidebarBatchMenuProvider(api);
       startMainSlashMenuShortcutBridge(api);
       return;
     }
@@ -96,17 +123,13 @@ module.exports = {
       defaults: {
         "hide-upgrade-prompts": true,
         "show-usage-in-sidebar": true,
-        "show-message-metrics-on-hover": false,
         "square-sidebar": false,
         "settings-search": true,
         "match-sidebar-width": true,
         "sidebar-action-grid": true,
         "sidebar-project-backgrounds": true,
         "render-markdown-preview-math": true,
-        "sidebar-chat-multi-select": false,
-        "show-pinned-chat-project-names": false,
         "slash-menu-polish": true,
-        "cross-account-history-refresh": true,
         "hide-usage-alert": true,
       },
     };
@@ -180,12 +203,6 @@ function renderSettings(root, state) {
         "Render 5-hour and weekly rate limits where the upgrade button was. Open the rate-limits breakdown (account menu → Rate limits) at least once to seed the values.",
     },
     {
-      id: "show-message-metrics-on-hover",
-      title: "Show message metrics on hover",
-      description:
-        "Show per-turn token usage beside assistant messages.",
-    },
-    {
       id: "square-sidebar",
       title: "Square sidebar corners",
       description:
@@ -216,28 +233,10 @@ function renderSettings(root, state) {
         "Add subtle grouped backgrounds behind project rows so adjacent projects are easier to scan.",
     },
     {
-      id: "sidebar-chat-multi-select",
-      title: "Multi-select sidebar chats",
-      description:
-        "Cmd/Ctrl-click sidebar chats to select multiple rows, then right-click for batch actions.",
-    },
-    {
-      id: "show-pinned-chat-project-names",
-      title: "Show project label for pinned chats",
-      description:
-        "Show a smaller, subdued project label under pinned chats, and under all chats in chronological list mode.",
-    },
-    {
       id: "slash-menu-polish",
       title: "Slash menu polish",
       description:
         "Tighten the composer slash menu with denser rows, clearer active state, and calmer section headers.",
-    },
-    {
-      id: "cross-account-history-refresh",
-      title: "Cross-account history refresh",
-      description:
-        "Refresh cloud conversation history after account changes. This requires the active provider to support account-scoped thread listing.",
     },
     {
       id: "hide-usage-alert",
@@ -377,6 +376,12 @@ function activateFeature(state, id) {
     state.api.log.info("activated", id);
   } catch (e) {
     state.api.log.error("activate failed", id, e);
+    if (typeof reportLifecycle === "function") {
+      reportLifecycle("feature-activation-failed", {
+        feature: id,
+        error: String(e?.stack || e),
+      });
+    }
   }
 }
 
@@ -411,9 +416,14 @@ const FEATURES = {
     const IMAGE_ATTR = "data-bennett-markdown-preview-image";
     const IMAGE_STATUS_ATTR = "data-bennett-markdown-preview-image-status";
     const IMAGE_MAX_BYTES = 20 * 1024 * 1024;
+    const IMAGE_CACHE_MAX_BYTES = 64 * 1024 * 1024;
+    const IMAGE_READ_CONCURRENCY = 2;
     const MARKDOWN_EXTENSION = /\.(?:md|markdown|mdown|mkd)$/i;
     const states = new Map();
     const imageCache = new Map();
+    let imageCacheBytes = 0;
+    const imageReadQueue = [];
+    let activeImageReads = 0;
     let disposed = false;
     let scanFrame = 0;
     let scanning = false;
@@ -712,16 +722,22 @@ const FEATURES = {
 
     function dispatchDesktopViewMessage(message) {
       let forwarded = false;
+      let pending = null;
       const bridge = window.electronBridge;
       if (typeof bridge?.sendMessageFromView === "function") {
         forwarded = true;
-        bridge.sendMessageFromView(message).catch(() => {});
+        try {
+          pending = Promise.resolve(bridge.sendMessageFromView(message));
+        } catch (error) {
+          pending = Promise.reject(error);
+        }
       }
       const event = new CustomEvent("codex-message-from-view", {
         detail: message,
       });
       if (forwarded) event.__codexForwardedViaBridge = true;
       window.dispatchEvent(event);
+      return pending;
     }
 
     function requestDesktopJson(command, params, timeoutMs = 15_000) {
@@ -777,7 +793,7 @@ const FEATURES = {
           finish(reject, new Error(`${command} timed out`));
         }, timeoutMs);
         window.addEventListener("message", onMessage);
-        dispatchDesktopViewMessage({
+        const pending = dispatchDesktopViewMessage({
           type: "fetch",
           requestId,
           method: "POST",
@@ -787,6 +803,32 @@ const FEATURES = {
           },
           body: JSON.stringify(params),
         });
+        pending?.catch((error) => finish(reject, error));
+      });
+    }
+
+    function pumpImageReadQueue() {
+      while (
+        !disposed &&
+        activeImageReads < IMAGE_READ_CONCURRENCY &&
+        imageReadQueue.length
+      ) {
+        const entry = imageReadQueue.shift();
+        activeImageReads += 1;
+        Promise.resolve()
+          .then(entry.task)
+          .then(entry.resolve, entry.reject)
+          .finally(() => {
+            activeImageReads -= 1;
+            pumpImageReadQueue();
+          });
+      }
+    }
+
+    function enqueueImageRead(task) {
+      return new Promise((resolve, reject) => {
+        imageReadQueue.push({ task, resolve, reject });
+        pumpImageReadQueue();
       });
     }
 
@@ -971,33 +1013,69 @@ const FEATURES = {
       }[extension] || null;
     }
 
+    function codexLocalMediaUrl(path) {
+      if (
+        !/^[A-Za-z]:[\\/]/.test(path) &&
+        !/^[\\/]{2}/.test(path) &&
+        !path.startsWith("/")
+      ) {
+        return null;
+      }
+      const normalized = path.replace(/\\/g, "/");
+      const encoded = encodeURI(normalized)
+        .replaceAll("#", "%23")
+        .replaceAll("?", "%3F");
+      return `app://fs/@fs${encoded}`;
+    }
+
     function loadImageSource(target, filePath, hostId) {
       const resolved = resolveImageTarget(target, filePath);
       if (!resolved) return Promise.reject(new Error("图片路径为空"));
       if (/^(?:data|https?):/i.test(resolved)) return Promise.resolve(resolved);
+      if (!hostId || hostId === "local") {
+        const localMediaUrl = codexLocalMediaUrl(resolved);
+        if (localMediaUrl) return Promise.resolve(localMediaUrl);
+      }
       const key = `${hostId || "local"}\n${resolved}`;
-      let pending = imageCache.get(key);
-      if (pending) return pending;
-      pending = requestDesktopJson("read-file-binary", {
+      const cached = imageCache.get(key);
+      if (cached) {
+        imageCache.delete(key);
+        imageCache.set(key, cached);
+        return cached.promise;
+      }
+      const entry = { promise: null, bytes: 0 };
+      entry.promise = enqueueImageRead(() => requestDesktopJson("read-file-binary", {
         hostId: hostId || "local",
         path: resolved,
         maxBytes: IMAGE_MAX_BYTES,
-      }, 20_000)
+      }, 60_000))
         .then((result) => {
+          if (disposed) throw new Error("图片预览已停止");
           if (!result?.contentsBase64) {
             if (/^https?:\/\//i.test(resolved)) return resolved;
             throw new Error("图片不存在、格式不受支持或超过 20 MB");
           }
           const mimeType = imageMimeType(resolved, result.mimeType);
           if (!mimeType) throw new Error("文件不是支持的图片格式");
+          entry.bytes = Math.ceil(result.contentsBase64.length * 0.75);
+          imageCacheBytes += entry.bytes;
+          while (imageCacheBytes > IMAGE_CACHE_MAX_BYTES && imageCache.size > 1) {
+            const oldestKey = imageCache.keys().next().value;
+            const oldest = imageCache.get(oldestKey);
+            imageCache.delete(oldestKey);
+            imageCacheBytes = Math.max(0, imageCacheBytes - (oldest?.bytes || 0));
+          }
           return `data:${mimeType};base64,${result.contentsBase64}`;
         })
         .catch((error) => {
-          imageCache.delete(key);
+          if (imageCache.get(key) === entry) {
+            imageCache.delete(key);
+            imageCacheBytes = Math.max(0, imageCacheBytes - entry.bytes);
+          }
           throw error;
         });
-      imageCache.set(key, pending);
-      return pending;
+      imageCache.set(key, entry);
+      return entry.promise;
     }
 
     function currentMainModuleUrl() {
@@ -1623,7 +1701,9 @@ const FEATURES = {
         }
 
         destroy(dom) {
-          if (dom) dom.__bennettImageActive = false;
+          if (!dom) return;
+          dom.__bennettImageActive = false;
+          dom.__bennettImageObserver?.disconnect();
         }
 
         toDOM(view) {
@@ -1636,19 +1716,25 @@ const FEATURES = {
           element.setAttribute("aria-label", this.alt || this.title || this.target);
           element.tabIndex = 0;
           element.title = "单击编辑图片语法，Enter 提交，Esc 取消";
+          const loadingMessage = this.alt.trim()
+            ? `正在加载${this.alt.trim()}图片`
+            : "正在加载图片";
 
-          const renderStatus = (status, message) => {
+          let imageObserver = null;
+          let loadingStarted = false;
+
+          const renderStatus = (status, message, measure = true) => {
             element.removeAttribute(EDITING_ATTR);
             const statusElement = ownerDocument.createElement("span");
             statusElement.setAttribute(IMAGE_STATUS_ATTR, status);
             statusElement.textContent = message;
             element.replaceChildren(statusElement);
-            view.requestMeasure?.();
+            if (measure) view.requestMeasure?.();
           };
 
           const renderImage = () => {
             if (!element.__bennettImageActive) return;
-            renderStatus("loading", `正在加载图片：${this.alt || this.target}`);
+            renderStatus("loading", loadingMessage);
             loadImageSource(this.target, this.filePath, this.hostId)
               .then((source) => {
                 if (
@@ -1694,6 +1780,7 @@ const FEATURES = {
             if (element.hasAttribute(EDITING_ATTR)) return;
             event?.preventDefault();
             event?.stopPropagation();
+            imageObserver?.disconnect();
 
             const editor = ownerDocument.createElement("input");
             editor.type = "text";
@@ -1723,6 +1810,7 @@ const FEATURES = {
                 });
                 return;
               }
+              loadingStarted = true;
               renderImage();
             };
             editor.addEventListener("mousedown", (inputEvent) => {
@@ -1750,7 +1838,33 @@ const FEATURES = {
           element.addEventListener("keydown", (event) => {
             if (event.key === "Enter" || event.key === " ") beginEdit(event);
           });
-          renderImage();
+          const startLoading = () => {
+            if (loadingStarted || !element.__bennettImageActive) return;
+            loadingStarted = true;
+            imageObserver?.disconnect();
+            imageObserver = null;
+            element.__bennettImageObserver = null;
+            renderImage();
+          };
+          renderStatus(
+            "waiting",
+            loadingMessage,
+            false,
+          );
+          const IntersectionObserverClass = ownerDocument.defaultView?.IntersectionObserver;
+          if (typeof IntersectionObserverClass === "function") {
+            imageObserver = new IntersectionObserverClass((entries) => {
+              if (entries.some((entry) => entry.isIntersecting)) startLoading();
+            }, {
+              root: view.scrollDOM instanceof Element ? view.scrollDOM : null,
+              rootMargin: "400px 0px",
+              threshold: 0,
+            });
+            element.__bennettImageObserver = imageObserver;
+            imageObserver.observe(element);
+          } else {
+            startLoading();
+          }
           return element;
         }
       };
@@ -2217,6 +2331,9 @@ const FEATURES = {
             0,
           ),
           cachedImages: imageCache.size,
+          cachedImageBytes: imageCacheBytes,
+          queuedImageReads: imageReadQueue.length,
+          activeImageReads,
           nativeKatexLoaded: !!katexPromise && !lastError,
           implementation: "CodeMirror formula, table, and image replacement widgets",
           lastError,
@@ -2232,147 +2349,18 @@ const FEATURES = {
       if (scanFrame) cancelAnimationFrame(scanFrame);
       observer.disconnect();
       for (const state of Array.from(states.values())) removeState(state);
+      while (imageReadQueue.length) {
+        imageReadQueue.shift().reject(new Error("图片预览已停止"));
+      }
       imageCache.clear();
+      imageCacheBytes = 0;
       style.remove();
       delete window.__bennettMarkdownPreviewMath;
     };
   },
 
   /**
-   * Force Codex's recent-conversation cache to refresh after authentication
-   * changes. This is renderer-only so it can be used without rebuilding the
-   * Codex++ Rust launcher.
-   */
-  "cross-account-history-refresh"(api) {
-    const PATCH_VERSION = "3";
-    const clients = new Map();
-    let disposed = false;
-    let refreshTimer = null;
-    let scanTimer = null;
-    let modulePromise = null;
-    let initialRefreshScheduled = false;
-
-    const findAsset = (part) =>
-      Array.from(performance.getEntriesByType("resource"))
-        .map((entry) => entry.name)
-        .find((url) => {
-          const cleanUrl = String(url || "").split("?")[0];
-          return cleanUrl.includes("/assets/") && cleanUrl.includes(part) && cleanUrl.endsWith(".js");
-        }) || "";
-
-    const loadSignals = async () => {
-      if (!modulePromise) {
-        modulePromise = Promise.resolve().then(async () => {
-          const url = findAsset("app-initial-") || findAsset("app-server-manager-signals-");
-          if (!url) throw new Error("Codex history bridge asset not found");
-          return await import(url);
-        }).catch((error) => {
-          modulePromise = null;
-          throw error;
-        });
-      }
-      return await modulePromise;
-    };
-
-    const findRefreshBridge = (module) => {
-      if (typeof module?.ddt === "function") return module.ddt;
-      if (typeof module?.rn === "function") return module.rn;
-      return Object.values(module || {}).find((value) =>
-        typeof value === "function" && /sendRequest/.test(String(value)) && value.length >= 2,
-      );
-    };
-
-    const refresh = async (hostId = "local") => {
-      const signals = await loadSignals();
-      const bridge = findRefreshBridge(signals);
-      if (typeof bridge !== "function") throw new Error("Codex history bridge export not found");
-      await bridge("refresh-recent-conversations-for-host", {
-        hostId: hostId || "local",
-        mode: "expanded",
-        sortKey: "updated_at",
-      });
-    };
-
-    const schedule = (hostId = "local") => {
-      if (disposed) return;
-      if (refreshTimer) clearTimeout(refreshTimer);
-      refreshTimer = setTimeout(() => {
-        refreshTimer = null;
-        void refresh(hostId).catch((error) => api.log.debug("history refresh failed", error));
-      }, 1200);
-    };
-
-    const patchClient = (client) => {
-      if (!client || typeof client.addNotificationCallback !== "function") return;
-      if (client.__bennettCrossAccountHistoryRefresh === PATCH_VERSION) return;
-      try {
-        const cleanup = client.addNotificationCallback(
-          ["account/login/completed", "account/updated"],
-          (notification) => {
-            if (notification?.method === "account/login/completed" && notification.params?.success === false) return;
-            schedule(client.getHostId?.() || client.hostId || "local");
-          },
-        );
-        clients.set(client, typeof cleanup === "function" ? cleanup : null);
-        client.__bennettCrossAccountHistoryRefresh = PATCH_VERSION;
-      } catch (error) {
-        api.log.debug("history notification hook unavailable", error);
-      }
-    };
-
-    const scan = async () => {
-      if (disposed) return;
-      try {
-        const signals = await loadSignals();
-        for (const value of Object.values(signals || {})) {
-          patchClient(value);
-          if (value && typeof value.get === "function") {
-            try {
-              patchClient(value.get());
-            } catch {
-            }
-          }
-        }
-        if (!initialRefreshScheduled) {
-          initialRefreshScheduled = true;
-          schedule("local");
-        }
-      } catch (error) {
-        api.log.debug("history refresh hook pending", error);
-      }
-    };
-
-    const onWindowWake = () => schedule("local");
-    window.addEventListener("focus", onWindowWake);
-    window.addEventListener("online", onWindowWake);
-    document.addEventListener("visibilitychange", onWindowWake);
-    void scan();
-    scanTimer = setInterval(() => {
-      void scan();
-    }, 5000);
-
-    return () => {
-      disposed = true;
-      if (refreshTimer) clearTimeout(refreshTimer);
-      if (scanTimer) clearInterval(scanTimer);
-      window.removeEventListener("focus", onWindowWake);
-      window.removeEventListener("online", onWindowWake);
-      document.removeEventListener("visibilitychange", onWindowWake);
-      for (const [client, cleanup] of clients) {
-        try {
-          cleanup?.();
-        } catch {
-        }
-        if (client.__bennettCrossAccountHistoryRefresh === PATCH_VERSION) {
-          delete client.__bennettCrossAccountHistoryRefresh;
-        }
-      }
-      clients.clear();
-    };
-  },
-
-  /**
-   * Hide the "Upgrade" / "Get Plus" buttons. We match by visible text
+   * Hide the Plus/Pro plan "Upgrade" / "Get Plus" buttons while keeping Codex software-update notices visible. We match by visible text
    * across the document, skipping anything inside Codex's settings shell
    * or our own injected panels. Hidden via inline `display:none` so we
    * can restore it cleanly on dispose.
@@ -2391,6 +2379,8 @@ const FEATURES = {
       "upgrade to plus",
     ]);
     const CONTAINS = ["upgrade for higher limits"];
+    const APP_UPDATE_CONTEXT_RE =
+      /(?:\b(?:app|application|desktop|codex)\s+(?:update|upgrade|version|release)\b|\b(?:update|updated|updating|new version|latest version|release|download|restart|install)\b|软件升级|应用升级|版本升级|新版本|软件更新|应用更新|更新可用|下载更新|重启更新|安装包)/i;
     const hidden = new Set(/* HTMLElement */);
 
     const isInsideOurShell = (el) => {
@@ -2402,30 +2392,56 @@ const FEATURES = {
       return false;
     };
 
-    // Codex sometimes splits the label across icon + text spans, so we use
-    // textContent and collapse whitespace.
+    // Codex may split a label across icon + text spans, so use textContent
+    // for the button itself and semantic attributes for update banners.
     const normText = (el) =>
       (el.textContent || "").replace(/\s+/g, " ").trim().toLowerCase();
+    const semanticText = (el) =>
+      [
+        el.textContent,
+        el.getAttribute("aria-label"),
+        el.getAttribute("title"),
+        el.getAttribute("data-testid"),
+        el.getAttribute("data-test"),
+        el.id,
+        typeof el.className === "string" ? el.className : "",
+      ]
+        .filter(Boolean)
+        .join(" ")
+        .replace(/\s+/g, " ")
+        .trim()
+        .toLowerCase();
 
-    const matches = (text) => {
-      if (!text) return false;
+    const isAppUpdateControl = (el) => {
+      let n = el;
+      for (let depth = 0; n && depth < 5; depth += 1, n = n.parentElement) {
+        const text = semanticText(n);
+        // Avoid matching against the entire document body, which could contain
+        // an unrelated update message elsewhere in the page.
+        if (text.length <= 240 && APP_UPDATE_CONTEXT_RE.test(text)) return true;
+      }
+      return false;
+    };
+
+    const matches = (el, text) => {
+      if (!text || isAppUpdateControl(el)) return false;
       if (EXACT.has(text)) return true;
       for (const c of CONTAINS) if (text.includes(c)) return true;
       return false;
     };
-
-    const scan = () => {
-      const candidates = document.querySelectorAll(
-        'button, a, [role="button"], [role="menuitem"]',
-      );
+    const CANDIDATE_SELECTOR = 'button, a, [role="button"], [role="menuitem"]';
+    const scanRoot = (root) => {
+      const candidates = [];
+      if (root instanceof Element && root.matches(CANDIDATE_SELECTOR)) candidates.push(root);
+      if (root?.querySelectorAll) candidates.push(...root.querySelectorAll(CANDIDATE_SELECTOR));
       for (const el of candidates) {
-        if (hidden.has(el)) continue;
         if (isInsideOurShell(el)) continue;
         const t = normText(el);
         if (t.length === 0 || t.length > 80) continue;
-        if (!matches(t)) continue;
+        if (!matches(el, t)) continue;
         const host = el.closest('[class*="rounded"], [class*="badge"]') || el;
         if (!(host instanceof HTMLElement)) continue;
+        if (hidden.has(host)) continue;
         host.dataset.codexppPrevDisplay = host.style.display || "";
         host.style.display = "none";
         hidden.add(host);
@@ -2433,12 +2449,38 @@ const FEATURES = {
       }
     };
 
-    scan();
-    const obs = new MutationObserver(scan);
+    let scanTimer = 0;
+    const pendingRoots = new Set();
+    const flushPendingRoots = () => {
+      scanTimer = 0;
+      const roots = Array.from(pendingRoots);
+      pendingRoots.clear();
+      for (const root of roots) scanRoot(root);
+    };
+    const scheduleRoots = (records) => {
+      for (const record of records) {
+        for (const node of record.addedNodes) {
+          const root = node instanceof Element ? node : node.parentElement;
+          if (root instanceof Element) pendingRoots.add(root);
+        }
+      }
+      if (!pendingRoots.size) return;
+      if (pendingRoots.size > 40) {
+        pendingRoots.clear();
+        pendingRoots.add(document.documentElement);
+      }
+      if (scanTimer) window.clearTimeout(scanTimer);
+      scanTimer = window.setTimeout(flushPendingRoots, 100);
+    };
+
+    scanRoot(document);
+    const obs = new MutationObserver(scheduleRoots);
     obs.observe(document.documentElement, { childList: true, subtree: true });
 
     return () => {
       obs.disconnect();
+      if (scanTimer) window.clearTimeout(scanTimer);
+      pendingRoots.clear();
       for (const el of hidden) {
         if ("codexppPrevDisplay" in el.dataset) {
           el.style.display = el.dataset.codexppPrevDisplay;
@@ -2474,7 +2516,7 @@ const FEATURES = {
      * `resetAt` is whatever Codex shows verbatim (typically "HH:MM",
      * or "Wed, HH:MM" for weekly API data).
      */
-    let snapshot = null; // Do not render persisted quota data before this page fetches fresh usage.
+    let snapshot = readSnapshot(api);
     let mounted = null; // HTMLElement currently rendered in the sidebar
     let directUsageAvailable = false;
     let directUsageInFlight = false;
@@ -2484,6 +2526,7 @@ const FEATURES = {
     let usageBridgeReadyLogged = false;
     let usageBridgeScriptInjected = false;
     let bridgeRequestSeq = 0;
+    let disposed = false;
     let lastMountedMode = null;
     let accountMode = "unknown"; // "official" | "api" | "unknown"
     let accountModeInFlight = false;
@@ -2526,6 +2569,7 @@ const FEATURES = {
     };
 
     const applySnapshot = (partial, source) => {
+      if (disposed) return false;
       if (
         !partial?.fiveHour &&
         !partial?.weekly &&
@@ -2577,7 +2621,7 @@ const FEATURES = {
             hasElectronBridge: typeof window.electronBridge?.sendMessageFromView === "function",
           },
         }));
-        window.addEventListener("codexpp-usage-request", (event) => {
+        const onRequest = (event) => {
           const message = event.detail;
           if (!message || typeof message !== "object" || !message.requestId) return;
           pending.add(message.requestId);
@@ -2592,8 +2636,8 @@ const FEATURES = {
           });
           if (forwarded) forwardedEvent.__codexForwardedViaBridge = true;
           window.dispatchEvent(forwardedEvent);
-        });
-        window.addEventListener("message", (event) => {
+        };
+        const onMessage = (event) => {
           const data = event.data;
           if (
             !data ||
@@ -2611,34 +2655,35 @@ const FEATURES = {
             type: "codexpp-usage-response",
             detail: data,
           }, "*");
-        });
+        };
+        const stop = () => {
+          window.removeEventListener("codexpp-usage-request", onRequest);
+          window.removeEventListener("message", onMessage);
+          window.__codexppUsageBridgeInstalled = false;
+        };
+        window.addEventListener("codexpp-usage-request", onRequest);
+        window.addEventListener("message", onMessage);
+        window.addEventListener("codexpp-usage-bridge-stop", stop, { once: true });
       })();`;
       (document.head || document.documentElement).appendChild(script);
       script.remove();
     };
 
     const dispatchCodexViewMessage = (message) => {
-      ensureUsageBridgeScript();
-      window.dispatchEvent(
-        new CustomEvent("codexpp-usage-request", { detail: message }),
-      );
-
-      let forwarded = false;
       const bridge = window.electronBridge;
       if (typeof bridge?.sendMessageFromView === "function") {
-        forwarded = true;
         bridge.sendMessageFromView(message).catch((e) => {
           if (!directUsageFailureLogged) {
             directUsageFailureLogged = true;
             api.log.warn("[usage] bridge send failed", e);
           }
         });
+        return;
       }
-      const event = new CustomEvent("codex-message-from-view", {
-        detail: message,
-      });
-      if (forwarded) event.__codexForwardedViaBridge = true;
-      window.dispatchEvent(event);
+      ensureUsageBridgeScript();
+      window.dispatchEvent(
+        new CustomEvent("codexpp-usage-request", { detail: message }),
+      );
     };
 
     const fetchCodexAppServerJson = async (url, timeoutMs = 10_000) => {
@@ -2719,11 +2764,18 @@ const FEATURES = {
 
     const bridgePostJson = async (path, payload = {}, timeoutMs = 2_500) => {
       const bridge = window.__codexSessionDeleteBridge;
-      if (typeof bridge !== "function") return null;
-      return await Promise.race([
-        bridge(path, payload),
-        new Promise((resolve) => window.setTimeout(() => resolve(null), timeoutMs)),
-      ]);
+      if (disposed || typeof bridge !== "function") return null;
+      let timeout = 0;
+      try {
+        return await Promise.race([
+          bridge(path, payload),
+          new Promise((resolve) => {
+            timeout = window.setTimeout(() => resolve(null), timeoutMs);
+          }),
+        ]);
+      } finally {
+        if (timeout) window.clearTimeout(timeout);
+      }
     };
 
     const activeRelayProfile = (settings) => {
@@ -2763,6 +2815,7 @@ const FEATURES = {
         let nextMode = "unknown";
         let explicitMode = false;
         const settings = await bridgePostJson("/settings/get", {});
+        if (disposed) return accountMode;
         const profile = activeRelayProfile(settings);
         const relayMode = fieldValue(profile, "relayMode", "relay_mode");
         const officialMixApiKey = !!fieldValue(profile, "officialMixApiKey", "official_mix_api_key");
@@ -2786,6 +2839,7 @@ const FEATURES = {
 
         if (nextMode === "unknown") {
           const catalog = await bridgePostJson("/codex-model-catalog", {});
+          if (disposed) return accountMode;
           if (catalogLooksLikeApiMode(catalog)) nextMode = "api";
           else if (catalog?.model_provider === "openai" || catalog?.provider_name === "openai") {
             nextMode = "official";
@@ -2827,8 +2881,11 @@ const FEATURES = {
             at: Date.now(),
             apiMode: true,
           };
-        } else if (snapshot?.apiMode) {
-          snapshot = null;
+        } else {
+          // Keep the last stable value visible while the official snapshot
+          // refreshes. Clearing here caused the control to flash "—".
+          directUsageAvailable = false;
+          directUsageLastAttemptAt = 0;
         }
         ensureMounted(true);
         if (!accountModeLogged) {
@@ -2842,6 +2899,7 @@ const FEATURES = {
         accountModeInFlight = false;
       }
     };
+
     const remainingPercent = (usedPercent) => {
       const used = Number(usedPercent);
       if (!Number.isFinite(used)) return null;
@@ -3025,7 +3083,8 @@ const FEATURES = {
     };
 
     const refreshUsageFromApi = async () => {
-      if ((await refreshAccountMode()) !== "official") return false;
+      if (disposed) return false;
+      if ((await refreshAccountMode()) === "api" || disposed) return false;
       if (directUsageInFlight) return false;
       const now = Date.now();
       if (directUsageLastAttemptAt && now - directUsageLastAttemptAt < 15_000) {
@@ -3035,6 +3094,7 @@ const FEATURES = {
       directUsageInFlight = true;
       try {
         const status = await fetchCodexAppServerJson("/wham/usage");
+        if (disposed) return false;
         const partial = snapshotFromUsageStatus(status);
         if (partial.fiveHour || partial.weekly) {
           directUsageAvailable = true;
@@ -3286,6 +3346,14 @@ const FEATURES = {
     };
 
     const findUsageSidebar = () => {
+      const primarySidebar = Array.from(document.querySelectorAll(ASIDE_SELECTOR))
+        .find((sidebar) => {
+          if (!(sidebar instanceof HTMLElement) || !isVisibleElement(sidebar)) return false;
+          if (looksLikeSettingsSidebar(sidebar)) return false;
+          const rect = sidebar.getBoundingClientRect();
+          return rect.width >= 150 && rect.height >= 300;
+        });
+      if (primarySidebar instanceof HTMLElement) return primarySidebar;
       const candidates = new Set(
         Array.from(document.querySelectorAll(SIDEBAR_CANDIDATE_SELECTOR))
           .filter((node) => node instanceof HTMLElement),
@@ -3360,24 +3428,6 @@ const FEATURES = {
     const isUsageControlNode = (node) =>
       node.closest?.('[data-codexpp="usage-slot"], [data-codexpp="usage-box"], [data-codexpp="usage-boxes"]');
 
-    const rowControls = (row) =>
-      Array.from(row.querySelectorAll('button, a, [role="button"]'))
-        .filter((control) =>
-          control instanceof HTMLElement &&
-          isVisibleElement(control) &&
-          !isUsageControlNode(control),
-        );
-
-    const isSlotAfterRightmostControl = (slot) => {
-      const row = slot.parentElement;
-      if (!(row instanceof HTMLElement)) return false;
-      const controls = rowControls(row);
-      if (!controls.length) return true;
-      const slotRect = slot.getBoundingClientRect();
-      const rightmostControl = Math.max(...controls.map((control) => control.getBoundingClientRect().right));
-      return slotRect.right >= rightmostControl - 2;
-    };
-
     const nearestControlRow = (sidebar, button) => {
       const sidebarRect = sidebar.getBoundingClientRect();
       let row = button.parentElement;
@@ -3394,7 +3444,7 @@ const FEATURES = {
           insideSidebar &&
           nearBottom &&
           rect.height > 0 &&
-          rect.height <= 88 &&
+          rect.height <= 128 &&
           (style.display === "flex" || style.display === "grid" || buttonCount >= 2);
         if (looksLikeControlLayer) return row;
         row = row.parentElement;
@@ -3439,16 +3489,29 @@ const FEATURES = {
       return slot;
     };
 
+    const createFallbackSlot = (sidebar) => {
+      const existing = sidebar.querySelector(':scope > [data-codexpp="usage-slot"]');
+      if (existing instanceof HTMLElement) return existing;
+      const slot = document.createElement("div");
+      slot.dataset.codexpp = "usage-slot";
+      slot.dataset.codexppUsageSlot = "sidebar-floating-fallback";
+      slot.className = "flex items-center";
+      slot.style.position = "absolute";
+      slot.style.right = "0.75rem";
+      slot.style.bottom = "0.75rem";
+      slot.style.zIndex = "30";
+      sidebar.appendChild(slot);
+      return slot;
+    };
+
     const findSidebarSlot = () => {
       const sidebar = findUsageSidebar();
       if (!sidebar) return null;
       for (const slot of sidebar.querySelectorAll('[data-codexpp="usage-slot"]')) {
-        const row = slot.parentElement;
         if (
           !(slot instanceof HTMLElement) ||
-          !(row instanceof HTMLElement) ||
-          !isNearSidebarBottom(sidebar, row) ||
-          !isSlotAfterRightmostControl(slot)
+          !(slot.parentElement instanceof HTMLElement) ||
+          !slot.isConnected
         ) {
           slot.remove();
         }
@@ -3457,8 +3520,7 @@ const FEATURES = {
         .find((slot) =>
           slot instanceof HTMLElement &&
           slot.parentElement instanceof HTMLElement &&
-          isNearSidebarBottom(sidebar, slot.parentElement) &&
-          isSlotAfterRightmostControl(slot),
+          slot.isConnected,
         );
       if (existingSlot instanceof HTMLElement) return existingSlot;
 
@@ -3467,7 +3529,6 @@ const FEATURES = {
           button instanceof HTMLElement &&
           isVisibleElement(button) &&
           isNearSidebarBottom(sidebar, button) &&
-          !button.closest("section") &&
           !isUsageControlNode(button),
         );
       const deviceControls = controls.filter(isDeviceButton);
@@ -3510,7 +3571,7 @@ const FEATURES = {
         if (row) return createInlineSlot(row, anchor);
       }
 
-      return null;
+      return createFallbackSlot(sidebar);
     };
 
     const displaySnapshot = () =>
@@ -3533,9 +3594,9 @@ const FEATURES = {
           };
 
     const ensureMounted = (forceRebuild = false) => {
+      if (disposed) return;
       const visibleSnapshot = displaySnapshot();
       const slot = findSidebarSlot();
-      document.querySelectorAll('[data-codexpp="usage-floating-slot"]').forEach((node) => node.remove());
       if (!slot) {
         if (mounted) {
           mounted.remove();
@@ -3548,6 +3609,11 @@ const FEATURES = {
         }
         if (!ensureMounted._warned) {
           log("ensureMounted: no sidebar slot found yet");
+          if (typeof reportLifecycle === "function") {
+            reportLifecycle("usage-slot-missing", {
+              asideCount: document.querySelectorAll("aside").length,
+            });
+          }
           ensureMounted._warned = true;
         }
         return;
@@ -3584,6 +3650,11 @@ const FEATURES = {
         slotTag: slot.tagName,
         slotClass: slot.className,
       });
+      if (typeof reportLifecycle === "function") {
+        reportLifecycle("usage-mounted", {
+          mode: slot.dataset.codexppUsageSlot || "unknown",
+        });
+      }
     };
 
     // Initial render from persisted snapshot (so first paint isn't empty
@@ -3591,14 +3662,17 @@ const FEATURES = {
     ensureMounted(true);
 
     // ── observers ─────────────────────────────────────────────────────
-    // Codex mutates the renderer continuously while typing. Debounce quota
-    // work so we do not rescan the entire sidebar on every React commit.
+    // React can emit hundreds of mutations while restoring the history list.
+    // Ignore our own UI and editor churn, then coalesce the rest into one scan.
     let scheduled = false;
     let scheduleTimer = 0;
     const runMutationScan = async () => {
+      if (disposed) return;
       const mode = await refreshAccountMode();
-      if (mode === "official") await refreshUsageFromApi();
-      if (accountMode === "official" && !directUsageAvailable) {
+      if (disposed) return;
+      if (mode !== "api") await refreshUsageFromApi();
+      if (disposed) return;
+      if (accountMode !== "api" && !directUsageAvailable) {
         const grid = findBreakdownGrid();
         if (grid) scanBreakdown(grid);
         scanCompactUsage();
@@ -3635,6 +3709,10 @@ const FEATURES = {
     log("active", { snapshot });
 
     return () => {
+      disposed = true;
+      if (usageBridgeScriptInjected) {
+        window.dispatchEvent(new CustomEvent("codexpp-usage-bridge-stop"));
+      }
       obs.disconnect();
       window.clearInterval(interval);
       if (scheduleTimer) window.clearTimeout(scheduleTimer);
@@ -3656,132 +3734,36 @@ const FEATURES = {
 
   /** Hide exhaustion banners and reset prompts without touching conversation content. */
   "hide-usage-alert"() {
-    const STYLE_ID = "codexpp-bennett-hide-usage-alert-style";
+    const STYLE_ID = "codex-plus-hide-usage-alert-style";
     const HIDDEN_ATTR = "data-codex-plus-hidden-usage-alert";
-    const THREAD_FOOTER_SELECTOR =
-      "[data-thread-scroll-footer='true'], [data-thread-find-composer='true'], [data-codex-composer-root], [data-pip-obstacle='thread-footer']";
-    const SCAN_SELECTOR =
-      "[role='alert'], [role='status'], [aria-live], header, section, aside, div";
-    const COMPOSER_SURFACE_SELECTOR =
-      "[data-codex-composer='true'], .composer-footer, .ProseMirror, textarea, input, [contenteditable='true'], [role='textbox']";
-    const quotaBannerRe =
-      /(你的\s*Codex\s*消息限额已用尽|Codex\s*消息限额已用尽|消息限额已用尽|message\s+limit|usage\s+limit|you['’]?re\s+out\s+of\s+Codex\s+messages|out\s+of\s+Codex\s+messages|你的\s*Codex\s*已用完|你的\s*Codex\s*消息\s*额度|你的\s*速率限制|速率限制\s*(?:将于|重置)|额度|限额|quota|rate\s+limit)/i;
-    const quotaResetRe =
-      /(额度将于|继续使用\s*Codex|升级至\s*Plus|quota\s+will\s+reset|limit\s+will\s+reset|rate\s+limit\s+resets|resets?\s+on|continue\s+using\s+Codex|start\s+your\s+free\s+trial\s+of\s+Plus|upgrade\s+to\s+plus|速率限制|将于\s*\d|重置|reset)/i;
-    const usageCardRe =
-      /(剩余\s*\d+%\s*使用量|重置频率|下次重置时间|remaining\s+\d+%\s+usage|usage\s+remaining|reset\s+frequency|next\s+reset)/i;
-    const actionTextRe =
-      /(升级|Plus|upgrade|pricing|plan|重置|reset|限额|额度|限制|limit|quota)/i;
+    const quotaRe = /(Codex\s*消息限额已用尽|消息限额已用尽|message\s+limit|usage\s+limit|out\s+of\s+Codex\s+messages|额度|限额|quota|rate\s+limit)/i;
+    const resetRe = /(额度将于|继续使用\s*Codex|升级至\s*Plus|quota\s+will\s+reset|limit\s+will\s+reset|rate\s+limit\s+resets|reset|重置|upgrade\s+to\s+plus)/i;
+    const usageCardRe = /(剩余\s*\d+%\s*使用量|remaining\s+\d+%\s+usage|usage\s+remaining|reset\s+frequency|next\s+reset)/i;
+    const actionRe = /(升级|Plus|upgrade|pricing|重置|reset|限额|额度|限制|limit|quota)/i;
     const hidden = new Set();
     let observer = null;
     let timer = 0;
 
-    const normalizeText = (value) => String(value || "").replace(/\s+/g, " ").trim();
-    const candidateText = (node) =>
-      node instanceof HTMLElement ? normalizeText(node.innerText || node.textContent || "") : "";
+    const textOf = (node) => String(node?.innerText || node?.textContent || "").replace(/\s+/g, " ").trim();
     const visibleBox = (node) => {
       if (!(node instanceof HTMLElement)) return false;
       const rect = node.getBoundingClientRect();
-      if (!rect || rect.width < 180 || rect.height < 16) return false;
-      if (rect.bottom <= 0 || rect.top >= (window.innerHeight || 900)) return false;
-      if (rect.right <= 0 || rect.left >= (window.innerWidth || 1200)) return false;
-      return true;
+      return rect.width >= 160 && rect.height >= 16 && rect.bottom > 0 && rect.top < (window.innerHeight || 900);
     };
-    const bannerBox = (node) => {
+    const hasAction = (node, text) => actionRe.test(`${text} ${Array.from(node.querySelectorAll("button, a, [role='button']")).slice(0, 8).map((item) => textOf(item)).join(" ")}`);
+    const hasEditable = (node) => Boolean(node.querySelector("input, textarea, [contenteditable='true'], [role='textbox']"));
+    const touchesUsageControl = (node) => Boolean(node.closest("[data-codexpp='usage-slot'], [data-codexpp='usage-box'], [data-codexpp='usage-boxes']"));
+    const shouldHide = (node) => {
+      if (!(node instanceof HTMLElement) || node.closest("[data-message-author-role], article")) return false;
+      if (!node.matches("[role='alert'], [role='status'], [aria-live]")) return false;
       if (!visibleBox(node)) return false;
-      const rect = node.getBoundingClientRect();
-      return rect.width >= 300 && rect.height >= 30 && rect.height <= 180;
-    };
-    const usageCardBox = (node) => {
-      if (!visibleBox(node)) return false;
-      const rect = node.getBoundingClientRect();
-      return rect.width >= 160 && rect.width <= 560 && rect.height >= 70 && rect.height <= 340;
-    };
-    const insideConversationContent = (node) =>
-      Boolean(
-        node.closest(
-          [
-            "[data-message-author-role]",
-            "[data-testid*='message' i]",
-            "[data-test-id*='message' i]",
-            "[data-thread-find-target]",
-            "article",
-          ].join(","),
-        ),
-      );
-    const hasAction = (node, text) => {
-      const actionableText = normalizeText(
-        Array.from(node.querySelectorAll("button, a, [role='button']"))
-          .slice(0, 8)
-          .map((item) => item.innerText || item.textContent || item.getAttribute("aria-label") || "")
-          .join(" "),
-      );
-      return actionTextRe.test(`${text} ${actionableText}`);
-    };
-    const hasEditable = (node) =>
-      Boolean(node.querySelector("input, textarea, [contenteditable='true'], [role='textbox']"));
-    const touchesComposerSurface = (node) => Boolean(node.closest(COMPOSER_SURFACE_SELECTOR));
-    const touchesUsageControl = (node) =>
-      Boolean(node.closest("[data-codexpp='usage-slot'], [data-codexpp='usage-box'], [data-codexpp='usage-boxes']"));
-    const looksLikeQuotaBanner = (node) => {
-      if (insideConversationContent(node) || !bannerBox(node)) return false;
-      if (hasEditable(node) || touchesUsageControl(node) || touchesComposerSurface(node)) return false;
-      const text = candidateText(node);
-      if (text.length < 20 || text.length > 420) return false;
-      if (!quotaBannerRe.test(text) || !quotaResetRe.test(text)) return false;
-      return hasAction(node, text);
-    };
-    const looksLikeUsageCard = (node) => {
-      if (insideConversationContent(node) || !usageCardBox(node)) return false;
-      if (hasEditable(node) || touchesUsageControl(node) || touchesComposerSurface(node)) return false;
-      const text = candidateText(node);
-      if (text.length < 20 || text.length > 300) return false;
-      if (!usageCardRe.test(text)) return false;
-      if (!/剩余\s*\d+%\s*使用量|remaining\s+\d+%\s+usage|usage\s+remaining/i.test(text)) return false;
-      return hasAction(node, text);
-    };
-    const quotaBannerRoot = (node) => {
-      const parent = node.parentElement;
-      if (!parent || parent === document.body) return node;
-      const text = candidateText(parent);
-      if (text.length <= 420 && quotaBannerRe.test(text) && quotaResetRe.test(text) && bannerBox(parent)) return parent;
-      return node;
-    };
-    const usageCardRoot = (node) => {
-      if (node.getAttribute("role") === "status" && looksLikeUsageCard(node)) return node;
-      const status = node.closest('[role="status"]');
-      if (status && looksLikeUsageCard(status)) return status;
-      const childStatus = node.querySelector('[role="status"]');
-      if (childStatus && looksLikeUsageCard(childStatus)) return childStatus;
-      return node;
-    };
-    const shouldHide = (node, allowGeneric = false) => {
-      if (!(node instanceof HTMLElement) || insideConversationContent(node)) return false;
-      if (node.matches(THREAD_FOOTER_SELECTOR)) return false;
-      if (
-        !node.matches(
-          allowGeneric
-            ? "aside, header, section, div, [role='alert'], [role='status'], [aria-live]"
-            : "[role='alert'], [role='status'], [aria-live]",
-        )
-      ) return false;
-      if (!visibleBox(node) || hasEditable(node) || touchesUsageControl(node) || touchesComposerSurface(node)) return false;
-      const text = candidateText(node);
+      if (hasEditable(node) || touchesUsageControl(node)) return false;
+      const text = textOf(node);
       if (text.length < 12 || text.length > 500) return false;
       const rect = node.getBoundingClientRect();
-      const bannerLike =
-        rect.width >= 300 && rect.height >= 30 && rect.height <= 240 && quotaBannerRe.test(text) && quotaResetRe.test(text);
-      const cardLike =
-        rect.width >= 160 && rect.width <= 560 && rect.height >= 70 && rect.height <= 340 && usageCardRe.test(text);
+      const bannerLike = rect.width >= 300 && rect.height >= 30 && rect.height <= 240 && quotaRe.test(text) && resetRe.test(text);
+      const cardLike = rect.width >= 160 && rect.width <= 560 && rect.height >= 70 && rect.height <= 340 && usageCardRe.test(text) && hasAction(node, text);
       return (bannerLike || cardLike) && hasAction(node, text);
-    };
-    const findAlertTarget = (root) => {
-      if (!(root instanceof HTMLElement)) return null;
-      const candidates = [root, ...root.querySelectorAll("aside, [role='alert'], [role='status'], [aria-live]")];
-      for (const candidate of candidates) {
-        if (candidate instanceof HTMLElement && shouldHide(candidate, candidate.matches("aside"))) return candidate;
-      }
-      return null;
     };
     const hide = (node) => {
       if (!(node instanceof HTMLElement) || node === document.body || node === document.documentElement) return;
@@ -3791,28 +3773,18 @@ const FEATURES = {
     const scan = () => {
       timer = 0;
       if (!document.body) return;
-      for (const node of document.body.querySelectorAll(SCAN_SELECTOR)) {
-        if (!(node instanceof HTMLElement) || node.getAttribute(HIDDEN_ATTR) === "true") continue;
-        if (node.matches(THREAD_FOOTER_SELECTOR)) {
-          const target = findAlertTarget(node);
-          if (target && target.getAttribute(HIDDEN_ATTR) !== "true") hide(target);
-          continue;
-        }
-        const generic = node.matches("aside, header, section, div");
-        if (looksLikeQuotaBanner(node) || looksLikeUsageCard(node) || shouldHide(node, generic)) hide(node);
+      for (const node of document.body.querySelectorAll('[role="alert"], [role="status"], [aria-live]')) {
+        if (!node.hasAttribute(HIDDEN_ATTR) && shouldHide(node)) hide(node);
       }
     };
-    const schedule = (delay = 80) => {
-      if (!timer) timer = window.setTimeout(scan, delay);
+    const schedule = () => {
+      if (!timer) timer = window.setTimeout(scan, 80);
     };
     const style = document.createElement("style");
     style.id = STYLE_ID;
     style.textContent = `[${HIDDEN_ATTR}="true"] { display: none !important; visibility: hidden !important; pointer-events: none !important; }`;
-    document.getElementById(STYLE_ID)?.remove();
     document.documentElement.appendChild(style);
-    observer = new MutationObserver((mutations) => {
-      if (mutations.some((mutation) => mutation.addedNodes.length || mutation.type === "characterData")) schedule();
-    });
+    observer = new MutationObserver(schedule);
     observer.observe(document.documentElement, { childList: true, subtree: true, characterData: true });
     scan();
 
@@ -3824,6 +3796,7 @@ const FEATURES = {
       hidden.clear();
     };
   },
+
   /**
    * Square sidebar: the visual "rounded sidebar" is actually the main
    * content panel — `<main class="main-surface ... rounded-s-2xl">` —
@@ -7165,1107 +7138,48 @@ const FEATURES = {
       activeOriginals = originals;
     };
 
-    let scheduled = false;
-    const scheduleApply = () => {
-      if (scheduled) return;
-      scheduled = true;
-      requestAnimationFrame(() => {
-        scheduled = false;
+    let applyTimer = 0;
+    const scheduleApply = (delay = 120) => {
+      if (applyTimer) window.clearTimeout(applyTimer);
+      applyTimer = window.setTimeout(() => {
+        applyTimer = 0;
         apply();
+      }, delay);
+    };
+    const mutationsTouchActions = (records) => {
+      if (!activeOriginals.length || activeOriginals.some((node) => !node.isConnected)) {
+        return true;
+      }
+      return records.some((record) => {
+        const target = record.target instanceof Element
+          ? record.target
+          : record.target?.parentElement;
+        if (
+          target instanceof Element &&
+          activeOriginals.some((button) => target === button || target.contains(button) || button.contains(target))
+        ) {
+          return true;
+        }
+        return [...record.addedNodes, ...record.removedNodes].some((node) =>
+          node instanceof Element && activeOriginals.some((button) => node === button || node.contains(button)),
+        );
       });
     };
 
     clearStaleNodes();
     apply();
-    const obs = new MutationObserver(scheduleApply);
+    const obs = new MutationObserver((records) => {
+      if (mutationsTouchActions(records)) scheduleApply();
+    });
     obs.observe(document.body, { childList: true, subtree: true });
 
     api.log.info("sidebar action grid active");
 
     return () => {
       obs.disconnect();
+      if (applyTimer) window.clearTimeout(applyTimer);
       removeWrapper();
       cleanupMarks();
-      style.remove();
-    };
-  },
-
-  /**
-   * Let sidebar chat rows be multi-selected with Cmd/Ctrl-click, then expose
-   * batch actions from a right-click menu. We deliberately call Codex's native
-   * controls for the actual actions so the app owns persistence and side
-   * effects.
-   */
-  "sidebar-chat-multi-select"(api) {
-    const STYLE_ID = "codexpp-sidebar-chat-multi-select";
-    const ROW_ATTR = "data-codexpp-sidebar-chat-selectable";
-    const SELECTED_ATTR = "data-codexpp-sidebar-chat-selected";
-    const TARGET_ATTR = "data-codexpp-sidebar-chat-selected-target";
-    const MENU_ATTR = "data-codexpp-sidebar-chat-multi-select-menu";
-    const ASIDE_SELECTOR = [
-      "aside.pointer-events-auto.relative.flex.overflow-hidden",
-      "aside.pointer-events-auto.relative.flex.overflow-visible",
-      "aside.pointer-events-auto.relative.flex",
-    ].join(", ");
-    const SIDEBAR_CANDIDATE_SELECTOR = [
-      ASIDE_SELECTOR,
-      "aside",
-      "nav",
-      "[role='navigation']",
-      "[data-testid*='sidebar' i]",
-      "[data-test*='sidebar' i]",
-      "[class*='sidebar' i]",
-    ].join(", ");
-    const THREAD_SELECTOR = [
-      "[data-app-action-sidebar-thread-row]",
-      "[data-app-action-sidebar-thread-id]",
-      "[data-app-action-sidebar-task-id]",
-      "[data-sidebar-thread-id]",
-      "[data-app-action-sidebar-thread-pinned]",
-      "[data-app-action-sidebar-task-pinned]",
-      "[data-sidebar-thread-pinned]",
-    ].join(", ");
-    const selectedIds = new Set();
-    let disposed = false;
-    let lastAnchorId = null;
-    let actionInProgress = false;
-
-    document.getElementById(STYLE_ID)?.remove();
-    const style = document.createElement("style");
-    style.id = STYLE_ID;
-    style.textContent = `
-      [${ROW_ATTR}="true"] {
-        user-select: none !important;
-      }
-
-      [${TARGET_ATTR}="true"] {
-        background-color: var(--color-token-list-hover-background, color-mix(in srgb, currentColor 8%, transparent)) !important;
-        box-shadow: inset 0 0 0 1px color-mix(in srgb, currentColor 38%, transparent) !important;
-      }
-
-      [${MENU_ATTR}="item"][disabled] {
-        cursor: default !important;
-        opacity: 0.45 !important;
-      }
-
-      [${MENU_ATTR}="label"] {
-        flex: 1 1 auto !important;
-        min-width: 0 !important;
-      }
-    `;
-    document.head.appendChild(style);
-
-    const normalizeThreadId = (value) =>
-      String(value || "")
-        .trim()
-        .replace(/^(local|remote|pending-worktree):/, "");
-
-    const attrValue = (node, names) => {
-      if (!(node instanceof HTMLElement)) return null;
-      for (const name of names) {
-        const value = node.getAttribute(name);
-        if (value != null && value !== "") return value;
-      }
-      const suffixes = new Set(names.map((name) => name.split("-").at(-1)));
-      for (const attr of Array.from(node.attributes || [])) {
-        const name = attr.name.toLowerCase();
-        if (!name.includes("sidebar") || !name.includes("thread")) continue;
-        if (
-          names.some((expected) => name.endsWith(expected.replace(/^data-/, ""))) ||
-          Array.from(suffixes).some((suffix) => name.endsWith(`-${suffix}`))
-        ) {
-          return attr.value;
-        }
-      }
-      return null;
-    };
-
-    const threadMeta = (node) => {
-      if (!(node instanceof HTMLElement)) return null;
-      const id = attrValue(node, [
-        "data-app-action-sidebar-thread-id",
-        "data-app-action-sidebar-task-id",
-        "data-sidebar-thread-id",
-      ]);
-      const kind = attrValue(node, [
-        "data-app-action-sidebar-thread-kind",
-        "data-app-action-sidebar-task-kind",
-        "data-sidebar-thread-kind",
-      ]);
-      if (!id || (kind && kind !== "local")) return null;
-      return { id: normalizeThreadId(id) };
-    };
-
-    const mainSidebar = () => {
-      const aside = document.querySelector(ASIDE_SELECTOR);
-      return aside instanceof HTMLElement ? aside : null;
-    };
-
-    const interactiveTargetFor = (host, row) => {
-      const interactive = host?.closest?.(
-        [
-          "[role='button']",
-          "a",
-          "button",
-          "[class*='hover:bg-token-list-hover-background']",
-          "[class*='bg-token-list-selected-background']",
-          "[class*='bg-token-list-hover-background']",
-        ].join(", "),
-      );
-      if (interactive instanceof HTMLElement && row?.contains?.(interactive)) {
-        return interactive;
-      }
-      return host instanceof HTMLElement ? host : row;
-    };
-
-    const threadRows = () => {
-      const sidebar = mainSidebar();
-      if (!sidebar) return [];
-      const rows = new Map();
-      const candidates = sidebar.querySelectorAll(`${THREAD_SELECTOR}, [role='listitem']`);
-      for (const node of candidates) {
-        if (!(node instanceof HTMLElement)) continue;
-        const source = threadMeta(node) ? node : node.querySelector?.(THREAD_SELECTOR);
-        const meta = threadMeta(source);
-        if (!meta?.id) continue;
-        const row = source.closest("[role='listitem']") || source;
-        const host = source instanceof HTMLElement ? source : row;
-        if (!(row instanceof HTMLElement) || !(host instanceof HTMLElement)) continue;
-        rows.set(meta.id, {
-          id: meta.id,
-          row,
-          host,
-          target: interactiveTargetFor(host, row),
-        });
-      }
-      return Array.from(rows.values());
-    };
-
-    const rowRecordFromTarget = (target) => {
-      if (!(target instanceof Element)) return null;
-      const source =
-        target.closest?.(THREAD_SELECTOR) ||
-        target.closest?.("[role='listitem']")?.querySelector?.(THREAD_SELECTOR);
-      const row = source?.closest?.("[role='listitem']");
-      if (!(source instanceof HTMLElement) || !(row instanceof HTMLElement)) return null;
-      const meta = threadMeta(source);
-      if (!meta?.id) return null;
-      return {
-        id: meta.id,
-        row,
-        host: source,
-        target: interactiveTargetFor(source, row),
-      };
-    };
-
-    const selectedRecords = () => {
-      const rows = threadRows();
-      return Array.from(selectedIds)
-        .map((id) => rows.find((row) => row.id === id))
-        .filter(Boolean);
-    };
-
-    const clearSelection = () => {
-      selectedIds.clear();
-      lastAnchorId = null;
-      closeNativeMenu();
-      applySelection();
-    };
-
-    const toggleSelection = (id) => {
-      if (selectedIds.has(id)) selectedIds.delete(id);
-      else selectedIds.add(id);
-      lastAnchorId = id;
-      applySelection();
-    };
-
-    const selectOnly = (id) => {
-      selectedIds.clear();
-      selectedIds.add(id);
-      lastAnchorId = id;
-      applySelection();
-    };
-
-    const selectRangeTo = (id) => {
-      const rows = threadRows();
-      const start = rows.findIndex((row) => row.id === lastAnchorId);
-      const end = rows.findIndex((row) => row.id === id);
-      if (start < 0 || end < 0) {
-        toggleSelection(id);
-        return;
-      }
-      const [from, to] = start < end ? [start, end] : [end, start];
-      for (const row of rows.slice(from, to + 1)) selectedIds.add(row.id);
-      applySelection();
-    };
-
-    const applySelection = () => {
-      const rows = threadRows();
-      const visibleIds = new Set(rows.map((row) => row.id));
-      for (const id of Array.from(selectedIds)) {
-        if (!visibleIds.has(id)) selectedIds.delete(id);
-      }
-      document
-        .querySelectorAll(`[${ROW_ATTR}], [${SELECTED_ATTR}], [${TARGET_ATTR}]`)
-        .forEach((node) => {
-          node.removeAttribute?.(ROW_ATTR);
-          node.removeAttribute?.(SELECTED_ATTR);
-          node.removeAttribute?.(TARGET_ATTR);
-        });
-      for (const record of rows) {
-        record.row.setAttribute(ROW_ATTR, "true");
-        if (!selectedIds.has(record.id)) continue;
-        record.row.setAttribute(SELECTED_ATTR, "true");
-        record.target?.setAttribute?.(TARGET_ATTR, "true");
-      }
-    };
-
-    const isNativeActionClick = (target) =>
-      Boolean(target?.closest?.("button, input, textarea, select, [contenteditable='true']"));
-
-    const onClick = (event) => {
-      if (disposed || actionInProgress) return;
-      const record = rowRecordFromTarget(event.target);
-      if (!record) {
-        if (selectedIds.size && !event.target?.closest?.('[role="menu"]')) clearSelection();
-        return;
-      }
-      if (isNativeActionClick(event.target)) return;
-      if (event.metaKey || event.ctrlKey || event.shiftKey) {
-        event.preventDefault();
-        event.stopPropagation();
-        event.stopImmediatePropagation?.();
-        if (event.shiftKey) selectRangeTo(record.id);
-        else toggleSelection(record.id);
-        return;
-      }
-      if (selectedIds.size) {
-        clearSelection();
-      }
-    };
-
-    const onContextMenu = (event) => {
-      if (disposed || actionInProgress) return;
-      const record = rowRecordFromTarget(event.target);
-      if (selectedIds.size <= 1) return;
-      if (record && !selectedIds.has(record.id)) {
-        return;
-      }
-      if (!record && !mainSidebar()?.contains?.(event.target)) {
-        return;
-      }
-      event.preventDefault();
-      event.stopPropagation();
-      event.stopImmediatePropagation?.();
-      void openNativeBatchMenu(event.clientX, event.clientY);
-    };
-
-    const onPointerDown = (event) => {
-      if (disposed || actionInProgress || event.button !== 2) return;
-      const record = rowRecordFromTarget(event.target);
-      if (selectedIds.size <= 1) return;
-      if (record && !selectedIds.has(record.id)) return;
-      if (!record && !mainSidebar()?.contains?.(event.target)) return;
-      event.preventDefault();
-      event.stopPropagation();
-      event.stopImmediatePropagation?.();
-      void openNativeBatchMenu(event.clientX, event.clientY);
-    };
-
-    const onKeyDown = (event) => {
-      if (event.key === "Escape" && selectedIds.size) {
-        event.preventDefault();
-        clearSelection();
-      }
-    };
-
-    const wait = (ms) => new Promise((resolve) => window.setTimeout(resolve, ms));
-
-    const clickElement = (node) => {
-      if (!(node instanceof HTMLElement)) return false;
-      node.dispatchEvent(new MouseEvent("pointerdown", {
-        bubbles: true,
-        cancelable: true,
-        view: window,
-        button: 0,
-      }));
-      node.dispatchEvent(new MouseEvent("mousedown", {
-        bubbles: true,
-        cancelable: true,
-        view: window,
-        button: 0,
-      }));
-      node.dispatchEvent(new MouseEvent("pointerup", {
-        bubbles: true,
-        cancelable: true,
-        view: window,
-        button: 0,
-      }));
-      node.dispatchEvent(new MouseEvent("mouseup", {
-        bubbles: true,
-        cancelable: true,
-        view: window,
-        button: 0,
-      }));
-      node.click();
-      return true;
-    };
-
-    const buttonByAria = (row, label) =>
-      Array.from(row.querySelectorAll("button"))
-        .find((button) => button instanceof HTMLElement && button.getAttribute("aria-label") === label) || null;
-
-    const runRowButtonAction = async (label) => {
-      const records = selectedRecords();
-      closeNativeMenu();
-      actionInProgress = true;
-      try {
-        for (const record of records) {
-          const button = buttonByAria(record.row, label);
-          if (!button) continue;
-          clickElement(button);
-          await wait(90);
-        }
-      } finally {
-        actionInProgress = false;
-        clearSelection();
-      }
-    };
-
-    const findChatActionsButton = () =>
-      Array.from(document.querySelectorAll("button, [role='button']"))
-        .find((node) => node instanceof HTMLElement && node.getAttribute("aria-label") === "Chat actions") || null;
-
-    const findOpenMiniWindowItem = () =>
-      Array.from(document.querySelectorAll('[role="menu"][data-state="open"] [role="menuitem"], [role="menu"] [role="menuitem"]'))
-        .find((item) => item instanceof HTMLElement && item.textContent?.trim().includes("Open in mini window")) || null;
-
-    const openHeaderActionsMenu = async () => {
-      const button = findChatActionsButton();
-      if (!button) return false;
-      clickElement(button);
-      for (let i = 0; i < 8; i += 1) {
-        await wait(80);
-        if (findOpenMiniWindowItem()) return true;
-      }
-      return false;
-    };
-
-    const openRowsInMiniWindows = async () => {
-      const ids = Array.from(selectedIds);
-      closeNativeMenu();
-      actionInProgress = true;
-      try {
-        for (const id of ids) {
-          const record = threadRows().find((row) => row.id === id);
-          if (!record) continue;
-          clickElement(record.target || record.host);
-          await wait(450);
-          const hasMenu = await openHeaderActionsMenu();
-          if (!hasMenu) {
-            api.log.warn("[sidebar-chat-multi-select] chat actions menu unavailable", { id });
-            continue;
-          }
-          const item = findOpenMiniWindowItem();
-          if (!item) {
-            api.log.warn("[sidebar-chat-multi-select] open mini window item unavailable", { id });
-            continue;
-          }
-          clickElement(item);
-          await wait(300);
-        }
-      } finally {
-        actionInProgress = false;
-        clearSelection();
-      }
-    };
-
-    const actionAvailability = () => {
-      const records = selectedRecords();
-      return {
-        count: selectedIds.size || records.length,
-        canPin: records.some((record) => buttonByAria(record.row, "Pin chat")),
-        canArchive: records.some((record) => buttonByAria(record.row, "Archive chat")),
-      };
-    };
-
-    const openNativeBatchMenu = async (x, y) => {
-      const { count, canPin, canArchive } = actionAvailability();
-      if (!count) return;
-      if (openNativeBatchMenu._open) return;
-      openNativeBatchMenu._open = true;
-      let action = null;
-      try {
-        action =
-          (await api.ipc.invoke("sidebar-chat-batch-menu", {
-            x,
-            y,
-            count,
-            canPin,
-            canArchive,
-          })) || null;
-      } catch (e) {
-        api.log.warn("[sidebar-chat-multi-select] native batch menu unavailable", e);
-        return;
-      } finally {
-        openNativeBatchMenu._open = false;
-      }
-      if (action === "pin") await runRowButtonAction("Pin chat");
-      else if (action === "archive") await runRowButtonAction("Archive chat");
-      else if (action === "mini-window") await openRowsInMiniWindows();
-    };
-
-    const closeNativeMenu = () => {
-      document.dispatchEvent(new KeyboardEvent("keydown", {
-        key: "Escape",
-        bubbles: true,
-        cancelable: true,
-      }));
-    };
-
-    let scheduled = false;
-    const scheduleApply = () => {
-      if (scheduled || disposed) return;
-      scheduled = true;
-      requestAnimationFrame(() => {
-        scheduled = false;
-        applySelection();
-      });
-    };
-
-    applySelection();
-    const observer = new MutationObserver(scheduleApply);
-    observer.observe(document.body, { childList: true, subtree: true });
-    document.addEventListener("pointerdown", onPointerDown, true);
-    document.addEventListener("mousedown", onPointerDown, true);
-    document.addEventListener("click", onClick, true);
-    document.addEventListener("contextmenu", onContextMenu, true);
-    document.addEventListener("keydown", onKeyDown, true);
-
-    api.log.info("sidebar chat multi-select active");
-
-    return () => {
-      disposed = true;
-      observer.disconnect();
-      document.removeEventListener("pointerdown", onPointerDown, true);
-      document.removeEventListener("mousedown", onPointerDown, true);
-      document.removeEventListener("click", onClick, true);
-      document.removeEventListener("contextmenu", onContextMenu, true);
-      document.removeEventListener("keydown", onKeyDown, true);
-      closeNativeMenu();
-      selectedIds.clear();
-      document
-        .querySelectorAll(`[${ROW_ATTR}], [${SELECTED_ATTR}], [${TARGET_ATTR}]`)
-        .forEach((node) => {
-          node.removeAttribute?.(ROW_ATTR);
-          node.removeAttribute?.(SELECTED_ATTR);
-          node.removeAttribute?.(TARGET_ATTR);
-        });
-      style.remove();
-    };
-  },
-
-  /**
-   * Show a small project label under pinned sidebar chats. When Codex's
-   * sidebar is organized as a chronological list, show it under every local
-   * chat because project grouping is no longer visible.
-   */
-  "show-pinned-chat-project-names"(api) {
-    const STYLE_ID = "codexpp-pinned-chat-project-names";
-    const ATTR = "data-codexpp-pinned-chat-project-name";
-    const ROW_ATTR = "data-codexpp-pinned-chat-project-name-row";
-    const CONTENT_ATTR = "data-codexpp-pinned-chat-project-name-content";
-    const COMPACT_ATTR = "data-codexpp-pinned-chat-project-name-compact-row";
-    const COLOR_STORAGE_KEY = "sidebar-project-backgrounds:colors";
-    const ORGANIZE_MODE_KEY = "codex:persisted-atom:sidebar-organize-mode-v1";
-    const ASIDE_SELECTOR = [
-      "aside.pointer-events-auto.relative.flex.overflow-hidden",
-      "aside.pointer-events-auto.relative.flex.overflow-visible",
-      "aside.pointer-events-auto.relative.flex",
-    ].join(", ");
-    const SIDEBAR_CANDIDATE_SELECTOR = [
-      ASIDE_SELECTOR,
-      "aside",
-      "nav",
-      "[role='navigation']",
-      "[data-testid*='sidebar' i]",
-      "[data-test*='sidebar' i]",
-      "[class*='sidebar' i]",
-    ].join(", ");
-    const labels = new Map();
-    let disposed = false;
-    let refreshInFlight = false;
-    let lastRefreshAt = 0;
-
-    document.getElementById(STYLE_ID)?.remove();
-    const style = document.createElement("style");
-    style.id = STYLE_ID;
-    style.textContent = `
-      [${ATTR}="label"] {
-        display: flex !important;
-        align-items: center !important;
-        gap: 0 !important;
-        position: absolute !important;
-        left: var(--codexpp-pinned-chat-project-label-left, 2rem) !important;
-        right: var(--codexpp-pinned-chat-project-label-right, 2rem) !important;
-        bottom: 0.1875rem !important;
-        max-width: none !important;
-        min-width: 0 !important;
-        overflow: visible !important;
-        color: var(--color-token-text-secondary, currentColor) !important;
-        font-size: 0.6875rem !important;
-        line-height: 0.875rem !important;
-        opacity: 0.75 !important;
-        pointer-events: none !important;
-      }
-
-      [${ATTR}="dot"] {
-        width: 0.375rem !important;
-        height: 0.375rem !important;
-        border-radius: 9999px !important;
-        flex: 0 0 auto !important;
-        margin-left: 1px !important;
-        background-color: var(--codexpp-pinned-chat-project-color, currentColor) !important;
-      }
-
-      [${ATTR}="label"]:has([${ATTR}="dot"]) {
-        gap: 0.375rem !important;
-      }
-
-      [${ATTR}="label-text"] {
-        display: block !important;
-        min-width: 0 !important;
-        max-width: 100% !important;
-        overflow: hidden !important;
-        text-overflow: ellipsis !important;
-        white-space: nowrap !important;
-      }
-
-      [${CONTENT_ATTR}="true"] {
-        position: relative !important;
-        transform: translateY(-0.3125rem) !important;
-      }
-
-      [${COMPACT_ATTR}="true"] [${CONTENT_ATTR}="true"] > .w-4:first-child {
-        align-items: center !important;
-        display: flex !important;
-        height: 100% !important;
-        justify-content: center !important;
-        position: absolute !important;
-        left: -0.25rem !important;
-        top: 0.3125rem !important;
-        width: 1.5rem !important;
-        z-index: 20 !important;
-        transform: none !important;
-      }
-
-      [${COMPACT_ATTR}="true"] [${CONTENT_ATTR}="true"] > .w-4:first-child button {
-        align-items: center !important;
-        border: 1px solid transparent !important;
-        border-radius: 9999px !important;
-        color: var(--color-token-muted-foreground, currentColor) !important;
-        cursor: var(--cursor-interaction, pointer) !important;
-        display: flex !important;
-        gap: 0.25rem !important;
-        height: 1.25rem !important;
-        justify-content: center !important;
-        opacity: 0.5 !important;
-        padding: 0 !important;
-        pointer-events: auto !important;
-        user-select: none !important;
-        white-space: nowrap !important;
-        width: 1.25rem !important;
-      }
-
-      [${COMPACT_ATTR}="true"] [${CONTENT_ATTR}="true"] > .w-4:first-child button:hover,
-      [${COMPACT_ATTR}="true"] [${CONTENT_ATTR}="true"] > .w-4:first-child button:focus-visible {
-        color: var(--color-token-foreground, currentColor) !important;
-        opacity: 1 !important;
-      }
-
-      [${COMPACT_ATTR}="true"] [${CONTENT_ATTR}="true"] > .w-4:first-child button > svg {
-        height: 1rem !important;
-        width: 1rem !important;
-      }
-
-      [${COMPACT_ATTR}="true"] [${CONTENT_ATTR}="true"] > .w-4:first-child + div {
-        margin-left: 0.125rem !important;
-        padding-left: 0 !important;
-      }
-
-      [${COMPACT_ATTR}="true"] [${CONTENT_ATTR}="true"] > .w-4:first-child + div > div {
-        padding-right: 0.75rem !important;
-      }
-
-      [${COMPACT_ATTR}="true"]:hover [${CONTENT_ATTR}="true"] > .w-4:first-child + div > div,
-      [${COMPACT_ATTR}="true"]:focus-within [${CONTENT_ATTR}="true"] > .w-4:first-child + div > div {
-        -webkit-mask-image: linear-gradient(to right, transparent 0, transparent 21px, black 26px) !important;
-        mask-image: linear-gradient(to right, transparent 0, transparent 21px, black 26px) !important;
-      }
-
-      [${COMPACT_ATTR}="true"]:hover > [${ATTR}="label"],
-      [${COMPACT_ATTR}="true"]:focus-within > [${ATTR}="label"] {
-        -webkit-mask-image: linear-gradient(to right, transparent 0, transparent 21px, black 26px) !important;
-        mask-image: linear-gradient(to right, transparent 0, transparent 21px, black 26px) !important;
-      }
-
-      [${ROW_ATTR}="true"] {
-        --padding-row-y: 0 !important;
-        box-sizing: border-box !important;
-        height: 2.375rem !important;
-        min-height: 2.375rem !important;
-        padding-top: 0 !important;
-        padding-bottom: 0 !important;
-      }
-    `;
-    document.head.appendChild(style);
-
-    const mainSidebar = () => {
-      const aside = document.querySelector(ASIDE_SELECTOR);
-      return aside instanceof HTMLElement ? aside : null;
-    };
-
-    const normalizeThreadId = (value) =>
-      String(value || "")
-        .trim()
-        .replace(/^(local|remote|pending-worktree):/, "");
-
-    const normalizeProjectName = (value) =>
-      String(value || "").replace(/\s+/g, " ").trim().toLowerCase();
-
-    const normalizeProjectPath = (value) =>
-      String(value || "")
-        .replace(/^file:\/\//, "")
-        .replace(/[\\/]+$/, "")
-        .toLowerCase();
-
-    const sidebarOrganizeMode = () => {
-      try {
-        const raw = window.localStorage?.getItem(ORGANIZE_MODE_KEY);
-        if (!raw) return null;
-        try {
-          return JSON.parse(raw);
-        } catch {
-          return raw;
-        }
-      } catch {
-        return null;
-      }
-    };
-
-    const hasVisibleProjectRows = (sidebar) =>
-      Array.from(sidebar.querySelectorAll(
-        "[data-app-action-sidebar-project-row], div[role='listitem'].group\\/cwd",
-      )).some((node) => node instanceof HTMLElement && node.getBoundingClientRect().height > 0);
-
-    const hasThreadRows = (sidebar) =>
-      Boolean(sidebar.querySelector(
-        [
-          "[data-app-action-sidebar-thread-row]",
-          "[data-app-action-sidebar-thread-id]",
-          "[data-app-action-sidebar-task-id]",
-          "[data-sidebar-thread-id]",
-        ].join(", "),
-      ));
-
-    const hasAllChatsSection = (sidebar) =>
-      Boolean(sidebar.querySelector('[data-app-action-sidebar-section-heading="All chats"]'));
-
-    const isChronologicalList = (sidebar = mainSidebar()) => {
-      if (sidebar && hasAllChatsSection(sidebar)) return true;
-      const mode = sidebarOrganizeMode();
-      if (mode === "all") return true;
-      if (mode === "project") return false;
-      return Boolean(sidebar && hasThreadRows(sidebar) && !hasVisibleProjectRows(sidebar));
-    };
-
-    const projectInfoFor = (record) => {
-      const fallbackLabel = typeof record === "string" ? record : record?.label;
-      const cwd = typeof record?.cwd === "string" ? record.cwd : "";
-      const live = liveProjectInfoFor(fallbackLabel, cwd);
-      return {
-        label: live.label || fallbackLabel || "",
-        color: live.color || projectColorFor(live.label || fallbackLabel || ""),
-      };
-    };
-
-    const projectColorFor = (label) => {
-      const key = normalizeProjectName(label);
-      const storedPrefs = api.storage.get(COLOR_STORAGE_KEY, {});
-      const prefs = {
-        ...(storedPrefs && typeof storedPrefs === "object" && !Array.isArray(storedPrefs)
-          ? storedPrefs
-          : {}),
-        ...(window.__codexppSidebarProjectColorPrefs || {}),
-      };
-      const colors = {
-        blue: "var(--color-token-charts-blue, var(--color-token-text-link-foreground))",
-        green: "var(--color-token-charts-green, var(--color-token-text-secondary))",
-        yellow: "var(--color-token-charts-yellow, var(--color-token-text-secondary))",
-        red: "var(--color-token-charts-red, var(--color-token-text-secondary))",
-        pink: "var(--pink-400, var(--color-token-charts-purple, var(--color-token-text-link-foreground)))",
-        purple: "var(--color-token-charts-purple, var(--color-token-text-link-foreground))",
-        gray: "var(--color-token-text-secondary)",
-      };
-      if (colors[prefs[key]]) return colors[prefs[key]];
-
-      const auto = ["blue", "green", "yellow", "red"];
-      let hash = 0;
-      for (let i = 0; i < key.length; i += 1) {
-        hash = (hash * 31 + key.charCodeAt(i)) >>> 0;
-      }
-      return colors[auto[hash % auto.length]];
-    };
-
-    const liveProjectInfoFor = (label, cwd) => {
-      const key = normalizeProjectName(label);
-      const pathKey = normalizeProjectPath(cwd);
-      const rows = document.querySelectorAll('[data-codexpp-sidebar-project-backgrounds="row"]');
-      for (const row of rows) {
-        if (!(row instanceof HTMLElement)) continue;
-        const action = row.querySelector("[data-app-action-sidebar-project-id]");
-        const projectPath = action instanceof HTMLElement
-          ? normalizeProjectPath(action.getAttribute("data-app-action-sidebar-project-id"))
-          : "";
-        const rowLabelText =
-          row.getAttribute("aria-label") ||
-            row.getAttribute("title") ||
-            "";
-        const rowLabel = normalizeProjectName(rowLabelText);
-        const pathMatches = pathKey && projectPath && (
-          pathKey === projectPath ||
-          pathKey.startsWith(`${projectPath}/`) ||
-          projectPath.startsWith(`${pathKey}/`)
-        );
-        if (!pathMatches && (!key || rowLabel !== key)) continue;
-        const color =
-          row.style.getPropertyValue("--codexpp-project-tint").trim() ||
-          window.getComputedStyle(row).getPropertyValue("--codexpp-project-tint").trim();
-        return { label: rowLabelText, color };
-      }
-      return { label: "", color: "" };
-    };
-
-    const attrValue = (node, names) => {
-      for (const name of names) {
-        const value = node.getAttribute(name);
-        if (value != null && value !== "") return value;
-      }
-      const suffixes = new Set(names.map((name) => name.split("-").at(-1)));
-      for (const attr of Array.from(node.attributes || [])) {
-        const name = attr.name.toLowerCase();
-        if (!name.includes("sidebar") || !name.includes("thread")) continue;
-        if (
-          names.some((expected) => name.endsWith(expected.replace(/^data-/, ""))) ||
-          Array.from(suffixes).some((suffix) => name.endsWith(`-${suffix}`))
-        ) {
-          return attr.value;
-        }
-      }
-      return null;
-    };
-
-    const threadMeta = (node) => {
-      if (!(node instanceof HTMLElement)) return null;
-      const id = attrValue(node, [
-        "data-app-action-sidebar-thread-id",
-        "data-app-action-sidebar-task-id",
-        "data-sidebar-thread-id",
-      ]);
-      const pinned = attrValue(node, [
-        "data-app-action-sidebar-thread-pinned",
-        "data-app-action-sidebar-task-pinned",
-        "data-sidebar-thread-pinned",
-      ]);
-      const kind = attrValue(node, [
-        "data-app-action-sidebar-thread-kind",
-        "data-app-action-sidebar-task-kind",
-        "data-sidebar-thread-kind",
-      ]);
-      const isPinned = String(pinned) === "true";
-      if (!id || (kind && kind !== "local")) {
-        return null;
-      }
-      return { id: normalizeThreadId(id), pinned: isPinned };
-    };
-
-    const threadRows = () => {
-      const sidebar = mainSidebar();
-      if (!sidebar) return [];
-      const includeAllLocalChats = isChronologicalList(sidebar);
-      const rows = new Map();
-      const candidates = sidebar.querySelectorAll(
-        [
-          "[data-app-action-sidebar-thread-row]",
-          "[data-app-action-sidebar-thread-id]",
-          "[data-app-action-sidebar-task-id]",
-          "[data-sidebar-thread-id]",
-          "[data-app-action-sidebar-thread-pinned]",
-          "[data-app-action-sidebar-task-pinned]",
-          "[data-sidebar-thread-pinned]",
-          "[role='listitem']",
-        ].join(", "),
-      );
-      for (const node of candidates) {
-        if (!(node instanceof HTMLElement)) continue;
-        const source = threadMeta(node) ? node : node.querySelector?.(
-          [
-            "[data-app-action-sidebar-thread-row]",
-            "[data-app-action-sidebar-thread-id]",
-            "[data-app-action-sidebar-task-id]",
-            "[data-sidebar-thread-id]",
-            "[data-app-action-sidebar-thread-pinned]",
-            "[data-app-action-sidebar-task-pinned]",
-            "[data-sidebar-thread-pinned]",
-          ].join(", "),
-        );
-        const meta = threadMeta(source);
-        if (!meta?.id) continue;
-        if (!meta.pinned && !includeAllLocalChats) continue;
-        const row = source.closest("[role='listitem']") || source;
-        const host = source instanceof HTMLElement ? source : row;
-        if (row instanceof HTMLElement && host instanceof HTMLElement) {
-          const title = findThreadTitle(host, row);
-          rows.set(meta.id, { row, host, title, id: meta.id, pinned: meta.pinned });
-        }
-      }
-      return Array.from(rows.values());
-    };
-
-    const findThreadTitle = (host, row) => {
-      const selectors = [
-        "[data-thread-title]",
-        "[data-app-action-sidebar-thread-title]",
-        "[data-app-action-sidebar-task-title]",
-      ];
-      for (const selector of selectors) {
-        const node = host.querySelector(selector) || row.querySelector(selector);
-        if (node instanceof HTMLElement) return node;
-      }
-
-      const title = attrValue(host, [
-        "data-app-action-sidebar-thread-title",
-        "data-app-action-sidebar-task-title",
-        "data-sidebar-thread-title",
-      ]);
-      if (!title) return null;
-      return Array.from(host.querySelectorAll("span, div"))
-        .filter((node) => node instanceof HTMLElement)
-        .find((node) => compactText(node.textContent) === compactText(title)) || null;
-    };
-
-    const backgroundTargetsFor = (host, row) => {
-      const interactive = host?.closest?.(
-        [
-          "[role='button']",
-          "a",
-          "button",
-          "[class*='hover:bg-token-list-hover-background']",
-          "[class*='bg-token-list-selected-background']",
-          "[class*='bg-token-list-hover-background']",
-        ].join(", "),
-      );
-      if (interactive instanceof HTMLElement && row?.contains?.(interactive)) {
-        return [interactive];
-      }
-      return host instanceof HTMLElement ? [host] : [];
-    };
-
-    const reconcileRowPaddingTargets = (row, targets) => {
-      const active = new Set(targets);
-      const marked = [
-        row,
-        ...Array.from(row?.querySelectorAll?.(`[${ROW_ATTR}="true"]`) || []),
-      ];
-      for (const node of marked) {
-        if (node instanceof HTMLElement && !active.has(node)) {
-          node.removeAttribute(ROW_ATTR);
-        }
-      }
-    };
-
-    const contentTargetFor = (host, title) => {
-      if (!(host instanceof HTMLElement)) return null;
-      if (title instanceof HTMLElement) {
-        for (const child of Array.from(host.children)) {
-          if (child instanceof HTMLElement && child.contains(title)) return child;
-        }
-        return title.parentElement instanceof HTMLElement ? title.parentElement : null;
-      }
-      return host.firstElementChild instanceof HTMLElement ? host.firstElementChild : null;
-    };
-
-    const setLabelInlinePosition = (node, host, title) => {
-      if (!(node instanceof HTMLElement) || !(host instanceof HTMLElement)) return;
-      const anchor = title instanceof HTMLElement ? title : host;
-      const hostRect = host.getBoundingClientRect();
-      const anchorRect = anchor.getBoundingClientRect();
-      const left = Math.max(0, anchorRect.left - hostRect.left);
-      const right = Math.max(0, hostRect.right - anchorRect.right);
-      node.style.setProperty("--codexpp-pinned-chat-project-label-left", `${left}px`);
-      node.style.setProperty("--codexpp-pinned-chat-project-label-right", `${right}px`);
-    };
-
-    const removeStaleLabels = (activeRows) => {
-      const active = new Set(activeRows.map((item) => item.row));
-      document.querySelectorAll(`[${ATTR}="label"]`).forEach((node) => {
-        const row = node.closest("[role='listitem']");
-        if (!row || !active.has(row)) node.remove();
-      });
-      document.querySelectorAll(`[${ATTR}="title-stack"], [${ATTR}="title"]`)
-        .forEach((node) => node.removeAttribute(ATTR));
-      document.querySelectorAll(`[${CONTENT_ATTR}="true"]`)
-        .forEach((node) => {
-          const row = node.closest("[role='listitem']");
-          if (!row || !active.has(row)) {
-            node.removeAttribute(CONTENT_ATTR);
-          }
-        });
-      document.querySelectorAll(`[${COMPACT_ATTR}="true"]`).forEach((node) => {
-        const row = node.closest("[role='listitem']");
-        if (!row || !active.has(row)) node.removeAttribute(COMPACT_ATTR);
-      });
-      document.querySelectorAll(`[${ROW_ATTR}="true"]`).forEach((node) => {
-        const row = node.closest("[role='listitem']");
-        if (!row || !active.has(row)) node.removeAttribute(ROW_ATTR);
-      });
-    };
-
-    const renderLabels = () => {
-      const rows = threadRows();
-      const showAllLocalChats = isChronologicalList();
-      removeStaleLabels(rows);
-      for (const { row, host, title, id, pinned } of rows) {
-        const record = labels.get(id);
-        const info = projectInfoFor(record);
-        const label = info.label;
-        const target = host instanceof HTMLElement ? host : row;
-        const existing = target.querySelector(`[${ATTR}="label"]`);
-        const contentTarget = contentTargetFor(target, title);
-        if (!label) {
-          existing?.remove();
-          title?.removeAttribute(ATTR);
-          target.removeAttribute(ATTR);
-          contentTarget?.removeAttribute(CONTENT_ATTR);
-          target.removeAttribute(COMPACT_ATTR);
-          reconcileRowPaddingTargets(row, []);
-          continue;
-        }
-        const paddingTargets = backgroundTargetsFor(host, row);
-        reconcileRowPaddingTargets(row, paddingTargets);
-        paddingTargets.forEach((node) =>
-          node.setAttribute(ROW_ATTR, "true"),
-        );
-        title?.removeAttribute(ATTR);
-        target.removeAttribute(ATTR);
-        if (showAllLocalChats && !pinned) {
-          target.setAttribute(COMPACT_ATTR, "true");
-        } else {
-          target.removeAttribute(COMPACT_ATTR);
-        }
-        contentTarget?.setAttribute(CONTENT_ATTR, "true");
-        const node = existing instanceof HTMLElement
-          ? existing
-          : document.createElement("div");
-        node.setAttribute(ATTR, "label");
-        setLabelInlinePosition(node, target, title);
-        node.style.setProperty("--codexpp-pinned-chat-project-color", info.color);
-        const showDot = readFlag(api, "sidebar-project-backgrounds", true) && !showAllLocalChats;
-        let dot = node.querySelector(`[${ATTR}="dot"]`);
-        if (!showDot) {
-          dot?.remove();
-          dot = null;
-        } else if (!(dot instanceof HTMLElement)) {
-          dot = document.createElement("span");
-          dot.setAttribute(ATTR, "dot");
-        }
-        let text = node.querySelector(`[${ATTR}="label-text"]`);
-        if (!(text instanceof HTMLElement)) {
-          text = document.createElement("span");
-          text.setAttribute(ATTR, "label-text");
-        }
-        if (text.textContent !== label) text.textContent = label;
-        if (showDot && dot && (dot.parentElement !== node || text.parentElement !== node)) {
-          node.replaceChildren(dot, text);
-        } else if (!showDot && (text.parentElement !== node || node.children.length !== 1)) {
-          node.replaceChildren(text);
-        }
-        if (!node.parentElement) target.appendChild(node);
-      }
-    };
-
-    const refreshLabels = async (force = false) => {
-      const rows = threadRows();
-      const ids = rows.map((row) => row.id);
-      if (ids.length === 0) {
-        removeStaleLabels([]);
-        return;
-      }
-      const now = Date.now();
-      if (!force && (refreshInFlight || now - lastRefreshAt < 10_000)) {
-        renderLabels();
-        return;
-      }
-      refreshInFlight = true;
-      lastRefreshAt = now;
-      try {
-        const next = await api.ipc.invoke("pinned-chat-project-labels", ids);
-        if (next && typeof next === "object") {
-          labels.clear();
-          for (const [id, value] of Object.entries(next)) {
-            if (typeof value === "string" && value.trim()) {
-              labels.set(normalizeThreadId(id), { label: value.trim(), cwd: "" });
-            } else if (value && typeof value === "object") {
-              const label = typeof value.label === "string" ? value.label.trim() : "";
-              const cwd = typeof value.cwd === "string" ? value.cwd : "";
-              if (label) labels.set(normalizeThreadId(id), { label, cwd });
-            }
-          }
-        }
-      } catch (e) {
-        api.log.warn("[pinned-chat-project-names] labels unavailable", e);
-      } finally {
-        refreshInFlight = false;
-        if (!disposed) renderLabels();
-      }
-    };
-
-    let scheduled = false;
-    const scheduleApply = () => {
-      if (scheduled || disposed) return;
-      scheduled = true;
-      requestAnimationFrame(() => {
-        scheduled = false;
-        refreshLabels();
-      });
-    };
-
-    refreshLabels(true);
-    const observer = new MutationObserver(scheduleApply);
-    observer.observe(document.body, { childList: true, subtree: true });
-    const interval = window.setInterval(() => refreshLabels(true), 60_000);
-    window.addEventListener("focus", scheduleApply);
-    window.addEventListener("storage", scheduleApply);
-    window.addEventListener("codexpp-ui-improvements-setting-changed", scheduleApply);
-    document.addEventListener("visibilitychange", scheduleApply);
-
-    api.log.info("pinned chat project names active");
-
-    return () => {
-      disposed = true;
-      observer.disconnect();
-      window.clearInterval(interval);
-      window.removeEventListener("focus", scheduleApply);
-      window.removeEventListener("storage", scheduleApply);
-      window.removeEventListener("codexpp-ui-improvements-setting-changed", scheduleApply);
-      document.removeEventListener("visibilitychange", scheduleApply);
-      document.querySelectorAll(`[${ATTR}="label"]`).forEach((node) => node.remove());
-      document.querySelectorAll(`[${ATTR}], [${ROW_ATTR}="true"], [${CONTENT_ATTR}="true"], [${COMPACT_ATTR}="true"]`).forEach((node) => {
-        node.removeAttribute?.(ATTR);
-        node.removeAttribute?.(ROW_ATTR);
-        node.removeAttribute?.(CONTENT_ATTR);
-        node.removeAttribute?.(COMPACT_ATTR);
-      });
       style.remove();
     };
   },
@@ -9047,9 +7961,10 @@ const FEATURES = {
       markRows(rows);
     };
 
-
+    let activeSidebar = null;
     const apply = () => {
       const sidebar = mainSidebar();
+      activeSidebar = sidebar instanceof HTMLElement ? sidebar : null;
       if (!sidebar) {
         return;
       }
@@ -9111,15 +8026,10 @@ const FEATURES = {
     };
 
     let scheduled = false;
-    let scheduleFrame = 0;
     let scheduleTimer = 0;
     const runScheduledApply = () => {
       if (!scheduled) return;
       scheduled = false;
-      if (scheduleFrame) {
-        cancelAnimationFrame(scheduleFrame);
-        scheduleFrame = 0;
-      }
       if (scheduleTimer) {
         window.clearTimeout(scheduleTimer);
         scheduleTimer = 0;
@@ -9128,20 +8038,33 @@ const FEATURES = {
       apply();
     };
 
-    const scheduleApply = () => {
-      if (scheduled || disposed) return;
+    const scheduleApply = (delay = 140) => {
+      if (disposed) return;
       scheduled = true;
-      scheduleFrame = requestAnimationFrame(runScheduledApply);
-      scheduleTimer = window.setTimeout(runScheduledApply, 80);
+      if (scheduleTimer) window.clearTimeout(scheduleTimer);
+      scheduleTimer = window.setTimeout(runScheduledApply, delay);
     };
 
-    let childListFrame = 0;
-    const scheduleApplySoon = () => {
-      if (disposed || childListFrame) return;
-      childListFrame = requestAnimationFrame(() => {
-        childListFrame = 0;
-        scheduleApply();
+    const scheduleApplyForMutations = (records) => {
+      if (disposed) return;
+      const sidebar = activeSidebar?.isConnected ? activeSidebar : null;
+      const relevant = records.some((record) => {
+        const target = record.target instanceof Element
+          ? record.target
+          : record.target?.parentElement;
+        if (sidebar && target instanceof Element && (target === sidebar || sidebar.contains(target))) {
+          return true;
+        }
+        return [...record.addedNodes, ...record.removedNodes].some((node) =>
+          node instanceof Element && (
+            node.matches?.(ASIDE_SELECTOR) ||
+            node.querySelector?.(ASIDE_SELECTOR) ||
+            node.hasAttribute?.("data-app-action-sidebar-project-id") ||
+            node.querySelector?.("[data-app-action-sidebar-project-id]")
+          ),
+        );
       });
+      if (relevant) scheduleApply();
     };
 
     apply();
@@ -9149,20 +8072,16 @@ const FEATURES = {
     const retryTimers = [250, 1000, 2500].map((delay) =>
       window.setTimeout(scheduleApply, delay),
     );
-    const observer = new MutationObserver(scheduleApplySoon);
+    const observer = new MutationObserver(scheduleApplyForMutations);
     observer.observe(document.body, {
       attributes: true,
       attributeFilter: [
         "aria-label",
-        "class",
         "data-app-action-sidebar-project-collapsed",
         "data-app-action-sidebar-project-id",
         "data-app-action-sidebar-project-label",
         "data-app-action-sidebar-project-row",
-        "data-codexpp-sidebar-project-expanded",
-        ATTR,
         "role",
-        "style",
       ],
       childList: true,
       subtree: true,
@@ -9170,119 +8089,26 @@ const FEATURES = {
     document.addEventListener("contextmenu", onProjectContextMenu, true);
     document.addEventListener("pointerdown", onProjectOverflowTrigger, true);
     document.addEventListener("click", onProjectOverflowTrigger, true);
-    window.addEventListener("focus", scheduleApply);
-    document.addEventListener("visibilitychange", scheduleApply);
+    const onWindowFocus = () => scheduleApply();
+    const onVisibilityChange = () => scheduleApply();
+    window.addEventListener("focus", onWindowFocus);
+    document.addEventListener("visibilitychange", onVisibilityChange);
 
     api.log.info("sidebar project backgrounds active");
 
     return () => {
       disposed = true;
       observer.disconnect();
-      if (childListFrame) cancelAnimationFrame(childListFrame);
-      if (scheduleFrame) cancelAnimationFrame(scheduleFrame);
       if (scheduleTimer) window.clearTimeout(scheduleTimer);
       retryTimers.forEach((timer) => window.clearTimeout(timer));
       document.removeEventListener("contextmenu", onProjectContextMenu, true);
       document.removeEventListener("pointerdown", onProjectOverflowTrigger, true);
       document.removeEventListener("click", onProjectOverflowTrigger, true);
-      window.removeEventListener("focus", scheduleApply);
-      document.removeEventListener("visibilitychange", scheduleApply);
+      window.removeEventListener("focus", onWindowFocus);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
       closeMenu();
       clearMarks();
       style.remove();
-    };
-  },
-
-  /**
-   * Add a Codex-native hover line to assistant messages with turn metrics.
-   * Metrics are read from the main process, which parses Codex's local
-   * `token_count` + `task_complete` JSONL events.
-   */
-  "show-message-metrics-on-hover"(api) {
-    const mounted = new Map();
-    const streamStats = new WeakMap();
-    let metrics = [];
-    let disposed = false;
-    let scanScheduled = false;
-    let scanTimer = 0;
-    let lastScanAt = 0;
-    const SCAN_THROTTLE_MS = 500;
-
-    const refreshMetrics = async () => {
-      try {
-        const next = await api.ipc.invoke("message-metrics");
-        if (Array.isArray(next)) {
-          metrics = next;
-          scheduleScan();
-        }
-      } catch (e) {
-        api.log.warn("[message-metrics] metrics unavailable", e);
-      }
-    };
-
-    const scheduleScan = () => {
-      if (scanScheduled || disposed) return;
-      scanScheduled = true;
-      const delay = Math.max(0, SCAN_THROTTLE_MS - (Date.now() - lastScanAt));
-      const run = () => {
-        scanTimer = 0;
-        requestAnimationFrame(() => {
-          scanScheduled = false;
-          lastScanAt = Date.now();
-          scanMessages();
-        });
-      };
-      if (delay > 0) scanTimer = window.setTimeout(run, delay);
-      else run();
-    };
-
-    const scanMessages = () => {
-      if (disposed || metrics.length === 0) return;
-      pruneMountedMessageMetrics();
-      const nodes = document.querySelectorAll("div.group.flex.min-w-0.flex-col");
-      for (const node of nodes) {
-        if (!(node instanceof HTMLElement)) continue;
-        const markdown = node.querySelector("._markdownContent_1rhk1_42");
-        if (!markdown) continue;
-        const rawText = markdown.textContent || "";
-        trackVisibleStream(streamStats, markdown, rawText);
-        const text = cleanMetricText(markdown.textContent || "");
-        if (text.length < 12) continue;
-        const match = findMetricForText(metrics, text);
-        if (!match) continue;
-        const displayMetric = addObservedTps(match, streamStats.get(markdown));
-        let line = node.querySelector("[data-codexpp-message-metrics]");
-        if (!line) {
-          line = renderMessageMetricLine(displayMetric);
-          node.appendChild(line);
-        } else {
-          updateMessageMetricLine(line, displayMetric);
-        }
-        mounted.set(node, line);
-      }
-    };
-
-    const pruneMountedMessageMetrics = () => {
-      for (const [node, line] of Array.from(mounted.entries())) {
-        if (node.isConnected && line.isConnected) continue;
-        line.remove();
-        mounted.delete(node);
-      }
-    };
-
-    const observer = new MutationObserver(scheduleScan);
-    observer.observe(document.documentElement, { childList: true, subtree: true });
-
-    refreshMetrics();
-    const timer = window.setInterval(refreshMetrics, 5_000);
-
-    return () => {
-      disposed = true;
-      observer.disconnect();
-      window.clearInterval(timer);
-      if (scanTimer) window.clearTimeout(scanTimer);
-      for (const [, line] of mounted) line.remove();
-      mounted.clear();
     };
   },
 
@@ -9290,36 +8116,11 @@ const FEATURES = {
 
 // ─────────────────────────────────────────────────────────────── helpers ──
 
-// ── message metrics ───────────────────────────────────────────────────────
-const METRICS_GLOBAL_KEY = "__bennettUiImprovementsMessageMetrics";
-const METRICS_HANDLER_KEY = "__bennettUiImprovementsMessageMetricsHandler";
+// ── main services ─────────────────────────────────────────────────────────
 const USAGE_GLOBAL_KEY = "__bennettUiImprovementsUsageService";
 const USAGE_HANDLER_KEY = "__bennettUiImprovementsUsageHandler";
-const PROJECT_LABEL_GLOBAL_KEY = "__bennettUiImprovementsProjectLabels";
-const PROJECT_LABEL_HANDLER_KEY = "__bennettUiImprovementsProjectLabelsHandler";
-const SIDEBAR_BATCH_MENU_GLOBAL_KEY = "__bennettUiImprovementsSidebarBatchMenu";
-const SIDEBAR_BATCH_MENU_HANDLER_KEY =
-  "__bennettUiImprovementsSidebarBatchMenuHandler";
 const SLASH_MENU_SHORTCUT_BRIDGE_KEY =
   "__bennettUiImprovementsSlashMenuShortcutBridge";
-
-function startMainMetricsProvider(api) {
-  const service = createMetricsService(api);
-  globalThis[METRICS_GLOBAL_KEY] = service;
-
-  // Codex++ currently exposes `handle()` without a matching removeHandler().
-  // Keep the registered IPC handler stable across hot reloads and swap the
-  // service behind it instead.
-  if (!globalThis[METRICS_HANDLER_KEY]) {
-    api.ipc.handle("message-metrics", () => {
-      const active = globalThis[METRICS_GLOBAL_KEY];
-      return active?.getMetrics?.() || [];
-    });
-    globalThis[METRICS_HANDLER_KEY] = true;
-  }
-
-  api.log.info("[message-metrics] main provider active");
-}
 
 function startMainUsageProvider(api) {
   const service = createUsageService(api);
@@ -9334,37 +8135,6 @@ function startMainUsageProvider(api) {
   }
 
   api.log.info("[usage] main provider active");
-}
-
-function startMainProjectLabelProvider(api) {
-  const service = createProjectLabelService(api);
-  globalThis[PROJECT_LABEL_GLOBAL_KEY] = service;
-
-  if (!globalThis[PROJECT_LABEL_HANDLER_KEY]) {
-    api.ipc.handle("pinned-chat-project-labels", (_ids = []) => {
-      const active = globalThis[PROJECT_LABEL_GLOBAL_KEY];
-      return active?.getLabels?.(_ids) || {};
-    });
-    globalThis[PROJECT_LABEL_HANDLER_KEY] = true;
-  }
-
-  api.log.info("[pinned-chat-project-names] main provider active");
-}
-
-function startMainSidebarBatchMenuProvider(api) {
-  globalThis[SIDEBAR_BATCH_MENU_GLOBAL_KEY] = {
-    show: showSidebarBatchMenu,
-  };
-
-  if (!globalThis[SIDEBAR_BATCH_MENU_HANDLER_KEY]) {
-    api.ipc.handle("sidebar-chat-batch-menu", (payload = {}) => {
-      const active = globalThis[SIDEBAR_BATCH_MENU_GLOBAL_KEY];
-      return active?.show?.(payload) || null;
-    });
-    globalThis[SIDEBAR_BATCH_MENU_HANDLER_KEY] = true;
-  }
-
-  api.log.info("[sidebar-chat-multi-select] main menu provider active");
 }
 
 function startMainSlashMenuShortcutBridge(api) {
@@ -9475,142 +8245,6 @@ function dispatchSlashMenuShortcutScript(digit) {
   `;
 }
 
-function showSidebarBatchMenu(payload) {
-  const { BrowserWindow, Menu } = require("electron");
-  const count = Math.max(0, Number(payload?.count) || 0);
-  if (!count) return null;
-
-  const win = BrowserWindow.getFocusedWindow();
-  if (!win || win.isDestroyed()) return null;
-
-  const x = Math.max(0, Math.round(Number(payload?.x) || 0));
-  const y = Math.max(0, Math.round(Number(payload?.y) || 0));
-  const canPin = payload?.canPin !== false;
-  const canArchive = payload?.canArchive !== false;
-  const suffix = count === 1 ? "" : "s";
-
-  return new Promise((resolve) => {
-    let settled = false;
-    const finish = (action) => {
-      if (settled) return;
-      settled = true;
-      resolve(action);
-    };
-
-    const menu = Menu.buildFromTemplate([
-      {
-        label: `Pin ${count} chat${suffix}`,
-        enabled: canPin,
-        click: () => finish("pin"),
-      },
-      {
-        label: `Archive ${count} chat${suffix}`,
-        enabled: canArchive,
-        click: () => finish("archive"),
-      },
-      {
-        label: `Open ${count} mini window${suffix}`,
-        click: () => finish("mini-window"),
-      },
-    ]);
-
-    menu.popup({
-      window: win,
-      x,
-      y,
-      callback: () => finish(null),
-    });
-  });
-}
-
-function createProjectLabelService(api) {
-  let cache = { at: 0, labels: new Map() };
-  const TTL_MS = 30_000;
-
-  return {
-    getLabels(ids) {
-      const requested = Array.isArray(ids)
-        ? ids.map(normalizeConversationId).filter(Boolean)
-        : [];
-      if (requested.length === 0) return {};
-      const now = Date.now();
-      if (now - cache.at > TTL_MS) {
-        try {
-          cache = { at: now, labels: readConversationProjectLabels() };
-        } catch (e) {
-          api.log.warn("[pinned-chat-project-names] scan failed", e);
-          cache = { at: now, labels: new Map() };
-        }
-      }
-      const out = {};
-      for (const id of requested) {
-        const record = cache.labels.get(id);
-        if (record) out[id] = record;
-      }
-      return out;
-    },
-  };
-}
-
-function readConversationProjectLabels() {
-  const fs = require("node:fs");
-  const path = require("node:path");
-  const home = process.env.HOME || require("node:os").homedir();
-  const roots = [
-    path.join(home, ".codex", "sessions"),
-    path.join(home, ".codex", "archived_sessions"),
-  ];
-  const files = [];
-  for (const root of roots) collectJsonlFiles(fs, root, files);
-  files.sort((a, b) => b.mtimeMs - a.mtimeMs);
-
-  const labels = new Map();
-  for (const file of files.slice(0, 5000)) {
-    const meta = readSessionMeta(fs, file.path);
-    const id = normalizeConversationId(meta?.id);
-    const cwd = typeof meta?.cwd === "string" ? meta.cwd : null;
-    if (!id || !cwd || labels.has(id)) continue;
-    const label = projectLabelForPath(path, cwd);
-    if (label) labels.set(id, { label, cwd });
-  }
-  return labels;
-}
-
-function readSessionMeta(fs, file) {
-  let fd = null;
-  try {
-    fd = fs.openSync(file, "r");
-    const buffer = Buffer.alloc(64 * 1024);
-    const bytes = fs.readSync(fd, buffer, 0, buffer.length, 0);
-    const firstLine = buffer.toString("utf8", 0, bytes).split("\n")[0];
-    if (!firstLine) return null;
-    const row = JSON.parse(firstLine);
-    return row?.type === "session_meta" ? row.payload : null;
-  } catch {
-    return null;
-  } finally {
-    if (fd != null) {
-      try {
-        fs.closeSync(fd);
-      } catch {
-        // Ignore close errors during best-effort sidebar labeling.
-      }
-    }
-  }
-}
-
-function projectLabelForPath(path, cwd) {
-  const normalized = String(cwd || "").replace(/[\\/]+$/, "");
-  if (!normalized || normalized === "~") return null;
-  return path.basename(normalized) || normalized;
-}
-
-function normalizeConversationId(value) {
-  const text = String(value || "").trim();
-  if (!text) return null;
-  return text.replace(/^(local|remote|pending-worktree):/, "");
-}
-
 function createUsageService(api) {
   let cache = { at: 0, value: null };
   const TTL_MS = 10_000;
@@ -9696,256 +8330,6 @@ function createUsageService(api) {
   }
 }
 
-function createMetricsService(api) {
-  let cache = { at: 0, items: [] };
-  const TTL_MS = 2_000;
-
-  return {
-    getMetrics() {
-      const now = Date.now();
-      if (now - cache.at < TTL_MS) return cache.items;
-      try {
-        cache = { at: now, items: readRecentMessageMetrics() };
-      } catch (e) {
-        api.log.warn("[message-metrics] scan failed", e);
-        cache = { at: now, items: [] };
-      }
-      return cache.items;
-    },
-  };
-}
-
-function readRecentMessageMetrics() {
-  const fs = require("node:fs");
-  const path = require("node:path");
-  const home = process.env.HOME || require("node:os").homedir();
-  const roots = [
-    path.join(home, ".codex", "sessions"),
-    path.join(home, ".codex", "archived_sessions"),
-  ];
-  const files = [];
-  for (const root of roots) collectJsonlFiles(fs, root, files);
-
-  files.sort((a, b) => b.mtimeMs - a.mtimeMs);
-
-  const byKey = new Map();
-  for (const file of files.slice(0, 20)) {
-    // Some long-running archived rollouts can be huge; recent visible
-    // conversations are covered by the smaller active session files.
-    if (file.size > 12 * 1024 * 1024) continue;
-    for (const item of parseMetricsFile(fs, file.path)) {
-      const key = item.turnId || `${item.completedAt}:${item.clean.slice(0, 80)}`;
-      if (!byKey.has(key)) byKey.set(key, item);
-    }
-    if (byKey.size >= 300) break;
-  }
-
-  return Array.from(byKey.values())
-    .sort((a, b) => (b.completedAt || 0) - (a.completedAt || 0))
-    .slice(0, 300);
-}
-
-function collectJsonlFiles(fs, dir, out) {
-  let entries;
-  try {
-    entries = fs.readdirSync(dir, { withFileTypes: true });
-  } catch {
-    return;
-  }
-
-  for (const entry of entries) {
-    const full = `${dir}/${entry.name}`;
-    if (entry.isDirectory()) {
-      collectJsonlFiles(fs, full, out);
-    } else if (entry.isFile() && entry.name.endsWith(".jsonl")) {
-      try {
-        const stat = fs.statSync(full);
-        out.push({ path: full, mtimeMs: stat.mtimeMs, size: stat.size });
-      } catch {
-        // Ignore files that vanish during traversal.
-      }
-    }
-  }
-}
-
-function parseMetricsFile(fs, file) {
-  let text;
-  try {
-    text = fs.readFileSync(file, "utf8");
-  } catch {
-    return [];
-  }
-
-  const items = [];
-  let lastUsage = null;
-  for (const line of text.split("\n")) {
-    if (!line.includes('"type":"token_count"') && !line.includes('"type":"task_complete"')) {
-      continue;
-    }
-    let row;
-    try {
-      row = JSON.parse(line);
-    } catch {
-      continue;
-    }
-    const payload = row?.payload;
-    if (payload?.type === "token_count") {
-      lastUsage = payload.info || null;
-      continue;
-    }
-    if (payload?.type !== "task_complete" || !payload.last_agent_message) {
-      continue;
-    }
-
-    const clean = cleanMetricText(payload.last_agent_message);
-    if (!clean) continue;
-    const usage = lastUsage?.last_token_usage || null;
-
-    items.push({
-      turnId: payload.turn_id || null,
-      clean,
-      completedAt: numberOrNull(payload.completed_at),
-      usage,
-      contextWindow: numberOrNull(lastUsage?.model_context_window),
-    });
-  }
-  return items;
-}
-
-function renderMessageMetricLine(metric) {
-  const line = document.createElement("div");
-  line.dataset.codexppMessageMetrics = "true";
-  line.className =
-    "mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs " +
-    "text-token-text-secondary opacity-0 transition-opacity duration-150 " +
-    "group-hover:opacity-100";
-  updateMessageMetricLine(line, metric);
-  return line;
-}
-
-function updateMessageMetricLine(line, metric) {
-  const usage = metric.usage || {};
-  const parts = [];
-  if (typeof usage.input_tokens === "number") {
-    parts.push(`${formatCount(usage.input_tokens)} in`);
-  }
-  if (typeof usage.output_tokens === "number") {
-    parts.push(`${formatCount(usage.output_tokens)} out`);
-  }
-  if (typeof usage.reasoning_output_tokens === "number" && usage.reasoning_output_tokens > 0) {
-    parts.push(`${formatCount(usage.reasoning_output_tokens)} reasoning`);
-  }
-  if (typeof metric.observedTps === "number" && Number.isFinite(metric.observedTps)) {
-    parts.push(`${formatTps(metric.observedTps)} tok/s`);
-  }
-  const text = parts.join(" · ");
-  const title = messageMetricTitle(metric);
-  if (line.textContent !== text) line.textContent = text;
-  if (line.title !== title) line.title = title;
-}
-
-function trackVisibleStream(streamStats, markdown, rawText) {
-  const now = performance.now();
-  const text = String(rawText || "");
-  const previous = streamStats.get(markdown);
-  if (!previous) {
-    streamStats.set(markdown, {
-      firstAt: now,
-      lastAt: now,
-      lastText: text,
-      frozenTps: null,
-    });
-    return;
-  }
-  if (previous.lastText === text) return;
-  if (!previous.lastText && text) previous.firstAt = now;
-  previous.lastAt = now;
-  previous.lastText = text;
-}
-
-function addObservedTps(metric, stat) {
-  if (!stat) return metric;
-  if (typeof stat.frozenTps === "number") {
-    return { ...metric, observedTps: stat.frozenTps };
-  }
-  const outputTokens = numberOrNull(metric.usage?.output_tokens);
-  const elapsedMs = stat.lastAt - stat.firstAt;
-  if (outputTokens == null || elapsedMs < 500) return metric;
-  stat.frozenTps = outputTokens / (elapsedMs / 1000);
-  return { ...metric, observedTps: stat.frozenTps };
-}
-
-function findMetricForText(metrics, visibleText) {
-  const clean = cleanMetricText(visibleText);
-  if (!clean) return null;
-  for (const metric of metrics) {
-    const candidate = metric.clean || "";
-    if (!candidate) continue;
-    const head = candidate.slice(0, Math.min(120, candidate.length));
-    const tail = candidate.slice(Math.max(0, candidate.length - 80));
-    if (head.length >= 30 && clean.includes(head)) return metric;
-    if (clean.length >= 80 && candidate.includes(clean.slice(0, 120))) return metric;
-    if (head.length >= 30 && tail.length >= 30 && clean.includes(head) && clean.includes(tail)) {
-      return metric;
-    }
-  }
-  return null;
-}
-
-function cleanMetricText(text) {
-  return String(text || "")
-    .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
-    .replace(/`+/g, "")
-    .replace(/[*_~#>[\](){}|]/g, " ")
-    .replace(/https?:\/\/\S+/g, " ")
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function compactText(text) {
-  return String(text || "").replace(/\s+/g, " ").trim();
-}
-
-function messageMetricTitle(metric) {
-  const usage = metric.usage || {};
-  const lines = [
-    `Input tokens: ${formatRaw(usage.input_tokens)}`,
-    `Cached input: ${formatRaw(usage.cached_input_tokens)}`,
-    `Output tokens: ${formatRaw(usage.output_tokens)}`,
-    `Reasoning output: ${formatRaw(usage.reasoning_output_tokens)}`,
-    `Total tokens: ${formatRaw(usage.total_tokens)}`,
-  ];
-  if (typeof metric.observedTps === "number") {
-    lines.push(`Observed stream rate: ${formatTps(metric.observedTps)} tok/s`);
-  }
-  return lines.join("\n");
-}
-
-function formatCount(n) {
-  if (typeof n !== "number" || !Number.isFinite(n)) return "—";
-  if (Math.abs(n) >= 1000000) return `${(n / 1000000).toFixed(1)}m`;
-  if (Math.abs(n) >= 1000) return `${(n / 1000).toFixed(1)}k`;
-  return String(n);
-}
-
-function formatRaw(n) {
-  return typeof n === "number" && Number.isFinite(n) ? String(n) : "—";
-}
-
-function formatTps(n) {
-  if (typeof n !== "number" || !Number.isFinite(n)) return "—";
-  return n >= 10 ? String(Math.round(n)) : n.toFixed(1);
-}
-
-function numberOrNull(value) {
-  return typeof value === "number" && Number.isFinite(value) ? value : null;
-}
-
-// ── usage snapshot persistence ────────────────────────────────────────────
-// Stored under storage["usage:snapshot"]; survives reloads. Schema:
-//   { fiveHour:{kind,pct,raw} | null, weekly:{kind,pct,raw} | null, at:number }
 function readSnapshot(api) {
   const v = api.storage.get("usage:snapshot", null);
   if (!v || typeof v !== "object") return null;
@@ -9964,14 +8348,6 @@ function writeSnapshot(api, snap) {
  * The returned element exposes `_refresh(snapshot)` so callers can update
  * values in place without unmount/remount.
  */
-function isApiSnapshot(snapshot) {
-  return Boolean(
-    snapshot?.apiMode === true ||
-      snapshot?.fiveHour?.apiMode === true ||
-      String(snapshot?.fiveHour?.label || "").trim().toUpperCase() === "API",
-  );
-}
-
 function renderUsageBox(api, snapshot) {
   const BASE_ORDER = ["5h", "weekly"];
   let order = [...BASE_ORDER];
@@ -10028,6 +8404,7 @@ function renderUsageBox(api, snapshot) {
     if (k === "weekly") return snap.weekly;
     return snap.points;
   };
+  const isApiSnapshot = (snap) => !!snap?.apiMode || !!snap?.fiveHour?.apiMode;
 
   /** Apply colors + text for the *value* state (i.e. not hover). */
   const applyValueState = (snap) => {
@@ -10226,10 +8603,6 @@ function switchControl(initial, onChange) {
     "sidebar-project-backgrounds",
     "render-markdown-preview-math",
     "slash-menu-polish",
-    "cross-account-history-refresh",
-    "show-message-metrics-on-hover",
-    "sidebar-chat-multi-select",
-    "show-pinned-chat-project-names",
     "hide-usage-alert",
   ];
   const featureInfo = [
@@ -10303,38 +8676,16 @@ function switchControl(initial, onChange) {
       defaultEnabled: true,
       status: "可用",
     },
-    {
-      id: "cross-account-history-refresh",
-      title: "跨账号会话刷新",
-      detail: "登录或切换账号后刷新云端会话列表。",
-      defaultEnabled: true,
-      status: "可用",
-    },
-    {
-      id: "show-message-metrics-on-hover",
-      title: "消息 token 指标",
-      detail: "旧实现需要从 main process 读取本地 Codex JSONL，而 BigPizzaV3 用户脚本无法访问这一层。",
-      defaultEnabled: false,
-      status: "当前运行环境不支持",
-      disabled: true,
-    },
-    {
-      id: "sidebar-chat-multi-select",
-      title: "侧栏会话多选",
-      detail: "选择界面可以部分运行，但批量 Pin / Archive / mini window 操作依赖旧的 Electron IPC。",
-      defaultEnabled: false,
-      status: "部分支持，默认关闭",
-    },
-    {
-      id: "show-pinned-chat-project-names",
-      title: "固定会话项目名",
-      detail: "旧实现需要从 main process 扫描本地会话文件。",
-      defaultEnabled: false,
-      status: "当前运行环境不支持",
-      disabled: true,
-    },
   ];
-  const settingsObserver = new MutationObserver(installSettingsPanel);
+  let settingsScanTimer = 0;
+  const scheduleSettingsPanelInstall = () => {
+    if (settingsScanTimer) return;
+    settingsScanTimer = window.setTimeout(() => {
+      settingsScanTimer = 0;
+      installSettingsPanel();
+    }, 100);
+  };
+  const settingsObserver = new MutationObserver(scheduleSettingsPanelInstall);
   settingsObserver.observe(document.documentElement, { childList: true, subtree: true });
   installSettingsPanel();
 
@@ -10363,14 +8714,24 @@ function switchControl(initial, onChange) {
 
   function installSettingsPanel() {
     const modal = document.querySelector(".codex-plus-modal-content");
-    if (!modal || modal.dataset.bennettUiSettingsVersion === VERSION) return;
+    if (!modal) return;
     const tabs = modal.querySelector(".codex-plus-tabs");
     const body = modal.querySelector(".codex-plus-modal-body");
     if (!tabs || !body) return;
+    const currentTab = tabs.querySelector('[data-codex-plus-tab="bennettUi"]');
+    const currentPanel = body.querySelector('[data-codex-plus-panel="bennettUi"]');
+    if (
+      modal.dataset.bennettUiSettingsLoadId === SCRIPT_LOAD_ID &&
+      currentTab &&
+      currentPanel
+    ) {
+      return;
+    }
     modal.dataset.bennettUiSettingsVersion = VERSION;
+    modal.dataset.bennettUiSettingsLoadId = SCRIPT_LOAD_ID;
 
-    tabs.querySelector('[data-codex-plus-tab="bennettUi"]')?.remove();
-    body.querySelector('[data-codex-plus-panel="bennettUi"]')?.remove();
+    tabs.querySelectorAll('[data-codex-plus-tab="bennettUi"]').forEach((node) => node.remove());
+    body.querySelectorAll('[data-codex-plus-panel="bennettUi"]').forEach((node) => node.remove());
 
     const tab = document.createElement("button");
     tab.type = "button";
@@ -10387,6 +8748,13 @@ function switchControl(initial, onChange) {
     panel.innerHTML = settingsPanelHtml();
     panel.addEventListener("click", (event) => {
       const target = event.target instanceof Element ? event.target : event.target?.parentElement;
+      const historyLoad = target?.closest("[data-bennett-ui-history-load]");
+      if (historyLoad) {
+        event.preventDefault();
+        event.stopPropagation();
+        void loadHistoryFromSettings(panel);
+        return;
+      }
       const toggle = target?.closest("[data-bennett-ui-feature]");
       if (!toggle) return;
       event.preventDefault();
@@ -10405,9 +8773,8 @@ function switchControl(initial, onChange) {
     return `
       <div class="codex-plus-row bennett-ui-settings-head">
         <div>
-          <div class="codex-plus-row-title">Bennett UI Improvements</div>
-          <div class="codex-plus-row-description">来源：b-nnett/codex-plusplus-bennett-ui。此迁移只保留能够在 BigPizzaV3 renderer-only 用户脚本环境中运行的功能。</div>
-          <div class="bennett-ui-settings-note">切换会尽量立即生效。如果 Codex DOM 变动导致残留，可重新加载用户脚本或重启 Codex++。</div>
+          <div class="codex-plus-row-title">Bennett UI Improvements ${escapeHtmlLocal(VERSION)}</div>
+          <div class="codex-plus-row-description">项目侧栏、额度显示、Markdown 预览与原生会话查询上限设置。</div>
         </div>
       </div>
       ${featureInfo.map((item) => `
@@ -10420,7 +8787,67 @@ function switchControl(initial, onChange) {
           <button type="button" class="codex-plus-toggle bennett-ui-toggle" data-bennett-ui-feature="${escapeAttr(item.id)}" ${item.disabled ? "disabled" : ""}><span></span></button>
         </div>
       `).join("")}
+      <div class="codex-plus-row bennett-ui-history-row" data-bennett-ui-history-row="true">
+        <div class="bennett-ui-history-copy">
+          <div class="codex-plus-row-title">会话历史加载</div>
+          <div class="codex-plus-row-description">仅提高 Codex 原生近期会话查询上限，不扫描、合并、补写或重新渲染会话。每次打开 Codex 后自动请求一次，也可手动重试。范围 ${HISTORY_TARGET_MIN}–${HISTORY_TARGET_MAX} 条。</div>
+          <div class="bennett-ui-feature-status" data-bennett-ui-history-status="true">由 Codex 原生读取和渲染；启动后自动请求</div>
+        </div>
+        <div class="bennett-ui-history-controls">
+          <input type="number" min="${HISTORY_TARGET_MIN}" max="${HISTORY_TARGET_MAX}" step="50" value="${readHistoryTarget()}" inputmode="numeric" aria-label="历史会话查询上限" data-bennett-ui-history-limit="true">
+          <button type="button" class="bennett-ui-history-load" data-bennett-ui-history-load="true">重新加载历史</button>
+        </div>
+      </div>
     `;
+  }
+
+  function normalizeHistoryTarget(value, fallback = HISTORY_TARGET_DEFAULT) {
+    const parsed = Number.parseInt(String(value ?? ""), 10);
+    if (!Number.isFinite(parsed)) return fallback;
+    return Math.max(HISTORY_TARGET_MIN, Math.min(HISTORY_TARGET_MAX, parsed));
+  }
+
+  function readHistoryTarget() {
+    try {
+      return normalizeHistoryTarget(window.localStorage.getItem(HISTORY_TARGET_STORAGE_KEY));
+    } catch {
+      return HISTORY_TARGET_DEFAULT;
+    }
+  }
+
+  function writeHistoryTarget(value) {
+    const normalized = normalizeHistoryTarget(value);
+    try {
+      window.localStorage.setItem(HISTORY_TARGET_STORAGE_KEY, String(normalized));
+    } catch {
+      // The loader can still use the value for this run when storage is unavailable.
+    }
+    return normalized;
+  }
+
+  async function loadHistoryFromSettings(panel) {
+    const input = panel.querySelector("[data-bennett-ui-history-limit]");
+    const button = panel.querySelector("[data-bennett-ui-history-load]");
+    const status = panel.querySelector("[data-bennett-ui-history-status]");
+    const limit = writeHistoryTarget(input?.value);
+    if (input) input.value = String(limit);
+    if (button) button.disabled = true;
+    if (status) status.textContent = `正在请求 Codex 原生历史，上限 ${limit} 条…`;
+    try {
+      const loader = window.__bennettUiEmbeddedHistoryLoader || window.__codexListPagebuster;
+      if (!loader || typeof loader.refresh !== "function") {
+        throw new Error("内置会话加载器尚未就绪，请稍后重试");
+      }
+      loader.setLimit?.(limit);
+      await loader.refresh(limit);
+      if (status) {
+        status.textContent = `已请求 Codex 原生历史，上限 ${limit} 条；侧栏由 Codex 自己渲染`;
+      }
+    } catch (error) {
+      if (status) status.textContent = `加载失败：${error?.message || String(error)}`;
+    } finally {
+      if (button) button.disabled = false;
+    }
   }
 
   function refreshSettingsPanel() {
@@ -10439,15 +8866,25 @@ function switchControl(initial, onChange) {
     const style = document.createElement("style");
     style.id = "bennett-ui-settings-style";
     style.textContent = `
+      [data-codex-plus-panel="bennettUi"] {
+        color: #f3f4f6 !important;
+        color-scheme: dark;
+      }
+      [data-codex-plus-panel="bennettUi"] .codex-plus-row-title {
+        color: #f3f4f6 !important;
+      }
+      [data-codex-plus-panel="bennettUi"] .codex-plus-row-description {
+        color: #a1a1aa !important;
+      }
       .bennett-ui-settings-note,
       .bennett-ui-feature-status {
         margin-top: 6px;
-        color: var(--text-secondary, var(--color-token-text-secondary, #8b8b8b));
+        color: #a1a1aa !important;
         font-size: 12px;
         line-height: 1.35;
       }
       .bennett-ui-feature-row[data-enabled="true"] .bennett-ui-feature-status {
-        color: var(--text-primary, var(--color-token-text-primary, #f5f5f5));
+        color: #d1d5db !important;
       }
       .bennett-ui-toggle[disabled] {
         cursor: not-allowed;
@@ -10455,6 +8892,56 @@ function switchControl(initial, onChange) {
       }
       .bennett-ui-toggle[data-enabled="true"] span {
         transform: translateX(14px);
+      }
+      .bennett-ui-history-row {
+        align-items: center;
+        gap: 18px;
+      }
+      .bennett-ui-history-copy {
+        min-width: 0;
+        flex: 1 1 auto;
+      }
+      .bennett-ui-history-controls {
+        display: flex;
+        flex: 0 0 auto;
+        align-items: center;
+        gap: 10px;
+      }
+      .bennett-ui-history-controls input {
+        box-sizing: border-box;
+        width: 130px;
+        min-height: 34px;
+        border: 1px solid var(--border-default, rgba(127, 127, 127, 0.45));
+        border-radius: 8px;
+        background: var(--background-primary, color-mix(in srgb, currentColor 6%, transparent));
+        color: #f3f4f6;
+        padding: 5px 10px;
+      }
+      .bennett-ui-history-load {
+        min-height: 34px;
+        border: 1px solid var(--border-default, rgba(127, 127, 127, 0.45));
+        border-radius: 8px;
+        background: var(--background-secondary, color-mix(in srgb, currentColor 9%, transparent));
+        color: #f3f4f6;
+        cursor: pointer;
+        padding: 5px 12px;
+      }
+      .bennett-ui-history-load:hover:not(:disabled) {
+        background: var(--background-tertiary, color-mix(in srgb, currentColor 15%, transparent));
+      }
+      .bennett-ui-history-load:disabled {
+        cursor: wait;
+        opacity: 0.55;
+      }
+      @media (max-width: 720px) {
+        .bennett-ui-history-row,
+        .bennett-ui-history-controls {
+          align-items: stretch;
+          flex-direction: column;
+        }
+        .bennett-ui-history-controls input {
+          width: 100%;
+        }
       }
     `;
     document.head.appendChild(style);
@@ -10481,28 +8968,64 @@ function switchControl(initial, onChange) {
 
   window[INSTALL_KEY] = {
     version: VERSION,
+    scriptLoadId: SCRIPT_LOAD_ID,
     api,
     features,
     featureInfo,
-    setFeature(id, enabled, reload = true) {
+    setFeature(id, enabled, reload = false) {
       setFeatureEnabled(id, enabled);
       if (reload) window.location.reload();
     },
     stop() {
+      for (const timer of lifecycleTimers) window.clearTimeout(timer);
+      lifecycleTimers.clear();
+      const embeddedHistory = window.__bennettUiEmbeddedHistoryLoader;
+      if (embeddedHistory && typeof embeddedHistory.stop === "function") {
+        try {
+          embeddedHistory.stop();
+        } catch (error) {
+          console.warn("[Bennett UI/BigPizza] history stop failed", error);
+        }
+      }
+      if (window.__bennettUiEmbeddedHistoryLoader === embeddedHistory) {
+        delete window.__bennettUiEmbeddedHistoryLoader;
+      }
+      if (window.__codexListPagebuster === embeddedHistory) {
+        delete window.__codexListPagebuster;
+      }
       settingsObserver.disconnect();
-      document.querySelector('[data-codex-plus-tab="bennettUi"]')?.remove();
-      document.querySelector('[data-codex-plus-panel="bennettUi"]')?.remove();
+      if (settingsScanTimer) window.clearTimeout(settingsScanTimer);
+      document.querySelectorAll('[data-codex-plus-tab="bennettUi"]').forEach((node) => node.remove());
+      document.querySelectorAll('[data-codex-plus-panel="bennettUi"]').forEach((node) => node.remove());
+      const settingsModal = document.querySelector(".codex-plus-modal-content");
+      if (settingsModal?.dataset.bennettUiSettingsLoadId === SCRIPT_LOAD_ID) {
+        delete settingsModal.dataset.bennettUiSettingsLoadId;
+        delete settingsModal.dataset.bennettUiSettingsVersion;
+      }
+      document.getElementById("bennett-ui-settings-style")?.remove();
       if (typeof tweak.stop === "function") {
         tweak.stop.call(tweak);
       }
     },
   };
 
+  reportLifecycle("script-loaded", {
+    readyState: document.readyState,
+    activeFeatures: Array.from(tweak._state?.features?.keys?.() || []),
+  });
+  scheduleLifecycle(() => {
+    const usageBox = document.querySelector('[data-codexpp="usage-box"], [data-codexpp="usage-boxes"]');
+    reportLifecycle("script-settled", {
+      activeFeatures: Array.from(tweak._state?.features?.keys?.() || []),
+      usageMounted: Boolean(usageBox),
+      usageSlotMode: usageBox?.parentElement?.dataset?.codexppUsageSlot || "",
+      asideCount: document.querySelectorAll("aside").length,
+    });
+  }, 1500);
+
   function createBigPizzaRendererApi() {
     const storagePrefix = "bennett-ui-improvements:";
     const blockedFeatureKeys = new Set([
-      "feature:show-message-metrics-on-hover",
-      "feature:show-pinned-chat-project-names",
     ]);
     const noop = () => {};
     const logWith = (level) => (...args) => {
@@ -10559,3 +9082,270 @@ function switchControl(initial, onChange) {
     };
   }
 })();
+
+/* BEGIN BENNETT EMBEDDED NATIVE HISTORY LOADER */
+/*
+ * Bennett UI native history limit helper.
+ *
+ * Its only responsibility is to ask Codex to refresh its own recent
+ * conversation list with a larger limit. Codex remains responsible for
+ * provider selection, storage, indexing, project grouping, pagination,
+ * pin/archive state, and sidebar rendering.
+ */
+(() => {
+  const DEFAULT_TARGET = 500;
+  const MIN_TARGET = 1;
+  const MAX_TARGET = 2000;
+  const SCRIPT_KEY = "__codexListPagebuster";
+  const TARGET_STORAGE_KEY = "__codexListPagebusterTarget";
+  const SCRIPT_LOAD_REFRESH_DELAYS_MS = [0, 1200, 3000, 6000];
+  const SIGNALS_MODULE_RE = /(?:\.\/)?(?:assets\/)?(?:app-server-manager-signals|app-initial)-[A-Za-z0-9_-]+\.js/g;
+  const SIGNALS_MODULE_FALLBACKS = [
+    "./assets/app-server-manager-signals-Csopz8aM.js",
+    "./assets/app-server-manager-signals-zAr_ejg8.js"
+  ];
+
+  if (window[SCRIPT_KEY]?.stop) {
+    window[SCRIPT_KEY].stop();
+  }
+
+  const state = {
+    stopped: false,
+    internalActionModulePromise: null,
+    startupTimers: new Set(),
+    startupAttempts: 0,
+    startupCompleted: false,
+    refreshInFlight: null,
+    refreshAttempts: 0,
+    lastRequestedLimit: 0,
+    lastRefreshAt: 0,
+    lastRefreshError: ""
+  };
+
+  function normalizeTarget(value, fallback = DEFAULT_TARGET) {
+    const parsed = Number.parseInt(String(value ?? ""), 10);
+    if (!Number.isFinite(parsed)) return fallback;
+    return Math.max(MIN_TARGET, Math.min(MAX_TARGET, parsed));
+  }
+
+  function readTarget() {
+    try {
+      return normalizeTarget(localStorage.getItem(TARGET_STORAGE_KEY));
+    } catch {
+      return DEFAULT_TARGET;
+    }
+  }
+
+  function writeTarget(value) {
+    const target = normalizeTarget(value);
+    try {
+      localStorage.setItem(TARGET_STORAGE_KEY, String(target));
+    } catch {
+      // The value can still be used for the current refresh.
+    }
+    return target;
+  }
+
+  function log(...args) {
+    try {
+      console.info("[Bennett history limit]", ...args);
+    } catch {}
+  }
+
+  function normalizeSignalsModulePath(path) {
+    if (!path) return "";
+    if (/^https?:|^app:|^file:/i.test(path)) return path;
+    const relative = String(path).replace(/^\.\//, "");
+    if (relative.startsWith("assets/")) return `./${relative}`;
+    if (/^(?:app-server-manager-signals|app-initial)-[A-Za-z0-9_-]+\.js$/.test(relative)) {
+      return `./assets/${relative}`;
+    }
+    return "";
+  }
+
+  function collectModuleNames(text, candidates) {
+    if (typeof text !== "string" || !text) return;
+    for (const match of text.matchAll(SIGNALS_MODULE_RE)) {
+      const candidate = normalizeSignalsModulePath(match[0]);
+      if (candidate) candidates.add(candidate);
+    }
+  }
+
+  function collectInternalActionModuleCandidates() {
+    const candidates = new Set();
+    const add = (value) => {
+      const candidate = normalizeSignalsModulePath(value);
+      if (candidate) candidates.add(candidate);
+    };
+
+    for (const script of document.querySelectorAll("script[src]")) {
+      const src = script.getAttribute("src") || "";
+      add(src);
+      collectModuleNames(src, candidates);
+    }
+
+    try {
+      for (const entry of performance.getEntriesByType("resource")) {
+        const name = String(entry.name || "");
+        if (/(?:app-server-manager-signals|app-initial)-/.test(name)) add(name);
+        collectModuleNames(name, candidates);
+      }
+    } catch {}
+
+    return Array.from(candidates);
+  }
+
+  async function discoverInternalActionModuleCandidates() {
+    const candidates = new Set(collectInternalActionModuleCandidates());
+
+    // Codex loads a tiny hashed entry module whose source names the current
+    // app-initial module. Read only that local app:// entry; do not crawl or
+    // fetch conversation resources.
+    for (const script of document.querySelectorAll("script[src]")) {
+      const src = script.getAttribute("src") || "";
+      if (!src) continue;
+      try {
+        const response = await fetch(src);
+        if (response.ok) collectModuleNames(await response.text(), candidates);
+      } catch {}
+    }
+
+    for (const fallback of SIGNALS_MODULE_FALLBACKS) candidates.add(fallback);
+    return Array.from(candidates);
+  }
+
+  function findInternalRequestHelper(mod) {
+    const preferred = ["oht", "ts", "It", "ln"];
+    const keys = [...preferred, ...Object.keys(mod || {})];
+    const checked = new Set();
+
+    for (const key of keys) {
+      if (checked.has(key)) continue;
+      checked.add(key);
+      const value = mod?.[key];
+      if (typeof value !== "function") continue;
+      try {
+        if (/sendRequest\s*\(/.test(Function.prototype.toString.call(value))) {
+          return value;
+        }
+      } catch {}
+    }
+    return null;
+  }
+
+  async function loadInternalActionModule() {
+    if (!state.internalActionModulePromise) {
+      state.internalActionModulePromise = (async () => {
+        let lastError = null;
+        for (const candidate of await discoverInternalActionModuleCandidates()) {
+          try {
+            const mod = await import(candidate);
+            const helper = findInternalRequestHelper(mod);
+            if (helper) return helper;
+          } catch (error) {
+            lastError = error;
+          }
+        }
+        throw lastError || new Error("未找到 Codex 原生历史刷新接口");
+      })().catch((error) => {
+        state.internalActionModulePromise = null;
+        throw error;
+      });
+    }
+    return state.internalActionModulePromise;
+  }
+
+  async function callInternalAction(type, payload) {
+    const sendRequest = await loadInternalActionModule();
+    return sendRequest(type, payload);
+  }
+
+  async function refresh(limit = readTarget()) {
+    const target = writeTarget(limit);
+    if (state.refreshInFlight && state.lastRequestedLimit === target) {
+      return state.refreshInFlight;
+    }
+
+    state.lastRequestedLimit = target;
+    state.refreshAttempts += 1;
+    state.lastRefreshError = "";
+
+    const request = callInternalAction("refresh-recent-conversations-for-host", {
+      hostId: "local",
+      mode: "expanded",
+      sortKey: "updated_at",
+      limit: target,
+      pageSize: target,
+      page_size: target
+    }).then(() => {
+      state.lastRefreshAt = Date.now();
+      log(`requested up to ${target} native conversations`);
+      return target;
+    }).catch((error) => {
+      state.lastRefreshError = error?.message || String(error);
+      throw error;
+    }).finally(() => {
+      if (state.refreshInFlight === request) state.refreshInFlight = null;
+    });
+
+    state.refreshInFlight = request;
+    return request;
+  }
+
+  function stop() {
+    state.stopped = true;
+    for (const timer of state.startupTimers) window.clearTimeout(timer);
+    state.startupTimers.clear();
+  }
+
+  function scheduleScriptLoadHistoryRefresh() {
+    SCRIPT_LOAD_REFRESH_DELAYS_MS.forEach((delay) => {
+      const timer = window.setTimeout(async () => {
+        state.startupTimers.delete(timer);
+        if (state.stopped || state.startupCompleted) return;
+        state.startupAttempts += 1;
+        try {
+          await refresh(readTarget());
+          state.startupCompleted = true;
+          for (const pending of state.startupTimers) window.clearTimeout(pending);
+          state.startupTimers.clear();
+        } catch (error) {
+          log("startup refresh failed", error?.message || String(error));
+        }
+      }, delay);
+      state.startupTimers.add(timer);
+    });
+  }
+
+  window[SCRIPT_KEY] = {
+    embeddedBy: "bennett-ui-improvements",
+    refresh,
+    getLimit: readTarget,
+    setLimit: writeTarget,
+    stop,
+    status: () => ({
+      configuredLimit: readTarget(),
+      lastRequestedLimit: state.lastRequestedLimit,
+      refreshAttempts: state.refreshAttempts,
+      lastRefreshAt: state.lastRefreshAt,
+      lastRefreshError: state.lastRefreshError,
+      startupAttempts: state.startupAttempts,
+      startupCompleted: state.startupCompleted,
+      renderer: "codex-native",
+      operation: "refresh-recent-conversations-for-host",
+      sessionQueries: false,
+      sessionReads: false,
+      sessionWrites: false,
+      providerMutation: false,
+      summaryHydration: false,
+      sidebarMutation: false,
+      projectExpansion: false,
+      href: location.href
+    })
+  };
+
+  window.__bennettUiEmbeddedHistoryLoader = window[SCRIPT_KEY];
+  scheduleScriptLoadHistoryRefresh();
+})();
+
+/* END BENNETT EMBEDDED NATIVE HISTORY LOADER */
