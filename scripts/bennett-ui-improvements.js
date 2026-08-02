@@ -1057,13 +1057,15 @@ const FEATURES = {
           }
           const mimeType = imageMimeType(resolved, result.mimeType);
           if (!mimeType) throw new Error("文件不是支持的图片格式");
-          entry.bytes = Math.ceil(result.contentsBase64.length * 0.75);
-          imageCacheBytes += entry.bytes;
-          while (imageCacheBytes > IMAGE_CACHE_MAX_BYTES && imageCache.size > 1) {
-            const oldestKey = imageCache.keys().next().value;
-            const oldest = imageCache.get(oldestKey);
-            imageCache.delete(oldestKey);
-            imageCacheBytes = Math.max(0, imageCacheBytes - (oldest?.bytes || 0));
+          if (imageCache.get(key) === entry) {
+            entry.bytes = Math.ceil(result.contentsBase64.length * 0.75);
+            imageCacheBytes += entry.bytes;
+            while (imageCacheBytes > IMAGE_CACHE_MAX_BYTES && imageCache.size > 1) {
+              const oldestKey = imageCache.keys().next().value;
+              const oldest = imageCache.get(oldestKey);
+              imageCache.delete(oldestKey);
+              imageCacheBytes = Math.max(0, imageCacheBytes - (oldest?.bytes || 0));
+            }
           }
           return `data:${mimeType};base64,${result.contentsBase64}`;
         })
@@ -9171,6 +9173,14 @@ function switchControl(initial, onChange) {
     }
   }
 
+  function isLocalScriptSource(src) {
+    const value = String(src || "").trim();
+    if (!value) return false;
+    if (/^app:/i.test(value)) return true;
+    if (/^[a-z][a-z0-9+.-]*:/i.test(value)) return false;
+    return !/^(?:\/\/|\\\\)/.test(value);
+  }
+
   function collectInternalActionModuleCandidates() {
     const candidates = new Set();
     const add = (value) => {
@@ -9203,7 +9213,7 @@ function switchControl(initial, onChange) {
     // fetch conversation resources.
     for (const script of document.querySelectorAll("script[src]")) {
       const src = script.getAttribute("src") || "";
-      if (!src) continue;
+      if (!isLocalScriptSource(src)) continue;
       try {
         const response = await fetch(src);
         if (response.ok) collectModuleNames(await response.text(), candidates);

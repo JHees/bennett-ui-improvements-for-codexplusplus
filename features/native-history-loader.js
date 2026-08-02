@@ -85,6 +85,14 @@
     }
   }
 
+  function isLocalScriptSource(src) {
+    const value = String(src || "").trim();
+    if (!value) return false;
+    if (/^app:/i.test(value)) return true;
+    if (/^[a-z][a-z0-9+.-]*:/i.test(value)) return false;
+    return !/^(?:\/\/|\\\\)/.test(value);
+  }
+
   function collectInternalActionModuleCandidates() {
     const candidates = new Set();
     const add = (value) => {
@@ -117,7 +125,7 @@
     // fetch conversation resources.
     for (const script of document.querySelectorAll("script[src]")) {
       const src = script.getAttribute("src") || "";
-      if (!src) continue;
+      if (!isLocalScriptSource(src)) continue;
       try {
         const response = await fetch(src);
         if (response.ok) collectModuleNames(await response.text(), candidates);
