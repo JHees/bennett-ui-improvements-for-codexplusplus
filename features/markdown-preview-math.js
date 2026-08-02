@@ -15,10 +15,12 @@
     const IMAGE_ATTR = "data-bennett-markdown-preview-image";
     const IMAGE_STATUS_ATTR = "data-bennett-markdown-preview-image-status";
     const IMAGE_MAX_BYTES = 20 * 1024 * 1024;
+    const IMAGE_CACHE_MAX_BYTES = 64 * 1024 * 1024;
     const IMAGE_READ_CONCURRENCY = 2;
     const MARKDOWN_EXTENSION = /\.(?:md|markdown|mdown|mkd)$/i;
     const states = new Map();
     const imageCache = new Map();
+    let imageCacheBytes = 0;
     const imageReadQueue = [];
     let activeImageReads = 0;
     let disposed = false;
@@ -634,28 +636,45 @@
         if (localMediaUrl) return Promise.resolve(localMediaUrl);
       }
       const key = `${hostId || "local"}\n${resolved}`;
-      let pending = imageCache.get(key);
-      if (pending) return pending;
-      pending = enqueueImageRead(() => requestDesktopJson("read-file-binary", {
+      const cached = imageCache.get(key);
+      if (cached) {
+        imageCache.delete(key);
+        imageCache.set(key, cached);
+        return cached.promise;
+      }
+      const entry = { promise: null, bytes: 0 };
+      entry.promise = enqueueImageRead(() => requestDesktopJson("read-file-binary", {
         hostId: hostId || "local",
         path: resolved,
         maxBytes: IMAGE_MAX_BYTES,
       }, 60_000))
         .then((result) => {
+          if (disposed) throw new Error("图片预览已停止");
           if (!result?.contentsBase64) {
             if (/^https?:\/\//i.test(resolved)) return resolved;
             throw new Error("图片不存在、格式不受支持或超过 20 MB");
           }
           const mimeType = imageMimeType(resolved, result.mimeType);
           if (!mimeType) throw new Error("文件不是支持的图片格式");
+          entry.bytes = Math.ceil(result.contentsBase64.length * 0.75);
+          imageCacheBytes += entry.bytes;
+          while (imageCacheBytes > IMAGE_CACHE_MAX_BYTES && imageCache.size > 1) {
+            const oldestKey = imageCache.keys().next().value;
+            const oldest = imageCache.get(oldestKey);
+            imageCache.delete(oldestKey);
+            imageCacheBytes = Math.max(0, imageCacheBytes - (oldest?.bytes || 0));
+          }
           return `data:${mimeType};base64,${result.contentsBase64}`;
         })
         .catch((error) => {
-          imageCache.delete(key);
+          if (imageCache.get(key) === entry) {
+            imageCache.delete(key);
+            imageCacheBytes = Math.max(0, imageCacheBytes - entry.bytes);
+          }
           throw error;
         });
-      imageCache.set(key, pending);
-      return pending;
+      imageCache.set(key, entry);
+      return entry.promise;
     }
 
     function currentMainModuleUrl() {
@@ -1911,6 +1930,7 @@
             0,
           ),
           cachedImages: imageCache.size,
+          cachedImageBytes: imageCacheBytes,
           queuedImageReads: imageReadQueue.length,
           activeImageReads,
           nativeKatexLoaded: !!katexPromise && !lastError,
@@ -1932,6 +1952,7 @@
         imageReadQueue.shift().reject(new Error("图片预览已停止"));
       }
       imageCache.clear();
+      imageCacheBytes = 0;
       style.remove();
       delete window.__bennettMarkdownPreviewMath;
     };

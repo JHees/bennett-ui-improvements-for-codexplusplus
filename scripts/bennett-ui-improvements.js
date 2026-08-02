@@ -21,7 +21,43 @@
   "use strict";
 
   const INSTALL_KEY = "__bennettUiImprovementsBigPizza";
-  const VERSION = "1.2.2";
+  const VERSION = "1.2.4";
+  const HISTORY_TARGET_STORAGE_KEY = "__codexListPagebusterTarget";
+  const HISTORY_TARGET_DEFAULT = 500;
+  const HISTORY_TARGET_MIN = 1;
+  const HISTORY_TARGET_MAX = 2000;
+  const SCRIPT_LOAD_ID = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const lifecycleTimers = new Set();
+  const lifecycleSignatures = new Set();
+
+  function reportLifecycle(event, detail = {}) {
+    const signature = `${event}:${JSON.stringify(detail)}`;
+    if (event === "usage-mounted" && lifecycleSignatures.has(signature)) return;
+    lifecycleSignatures.add(signature);
+    const payload = {
+      event: `bennett-ui.${event}`,
+      version: VERSION,
+      scriptLoadId: SCRIPT_LOAD_ID,
+      ...detail,
+    };
+    window.__bennettUiLastLifecycle = payload;
+    try {
+      const bridge = window.__codexSessionDeleteBridge;
+      if (typeof bridge === "function") {
+        Promise.resolve(bridge("/diagnostics/log", payload)).catch(() => {});
+      }
+    } catch (_) {}
+  }
+
+  function scheduleLifecycle(callback, delay) {
+    const timer = window.setTimeout(() => {
+      lifecycleTimers.delete(timer);
+      callback();
+    }, delay);
+    lifecycleTimers.add(timer);
+    return timer;
+  }
+
   const previous = window[INSTALL_KEY];
   if (previous && typeof previous.stop === "function") {
     try {
@@ -340,6 +376,12 @@ function activateFeature(state, id) {
     state.api.log.info("activated", id);
   } catch (e) {
     state.api.log.error("activate failed", id, e);
+    if (typeof reportLifecycle === "function") {
+      reportLifecycle("feature-activation-failed", {
+        feature: id,
+        error: String(e?.stack || e),
+      });
+    }
   }
 }
 
@@ -374,10 +416,12 @@ const FEATURES = {
     const IMAGE_ATTR = "data-bennett-markdown-preview-image";
     const IMAGE_STATUS_ATTR = "data-bennett-markdown-preview-image-status";
     const IMAGE_MAX_BYTES = 20 * 1024 * 1024;
+    const IMAGE_CACHE_MAX_BYTES = 64 * 1024 * 1024;
     const IMAGE_READ_CONCURRENCY = 2;
     const MARKDOWN_EXTENSION = /\.(?:md|markdown|mdown|mkd)$/i;
     const states = new Map();
     const imageCache = new Map();
+    let imageCacheBytes = 0;
     const imageReadQueue = [];
     let activeImageReads = 0;
     let disposed = false;
@@ -993,28 +1037,45 @@ const FEATURES = {
         if (localMediaUrl) return Promise.resolve(localMediaUrl);
       }
       const key = `${hostId || "local"}\n${resolved}`;
-      let pending = imageCache.get(key);
-      if (pending) return pending;
-      pending = enqueueImageRead(() => requestDesktopJson("read-file-binary", {
+      const cached = imageCache.get(key);
+      if (cached) {
+        imageCache.delete(key);
+        imageCache.set(key, cached);
+        return cached.promise;
+      }
+      const entry = { promise: null, bytes: 0 };
+      entry.promise = enqueueImageRead(() => requestDesktopJson("read-file-binary", {
         hostId: hostId || "local",
         path: resolved,
         maxBytes: IMAGE_MAX_BYTES,
       }, 60_000))
         .then((result) => {
+          if (disposed) throw new Error("图片预览已停止");
           if (!result?.contentsBase64) {
             if (/^https?:\/\//i.test(resolved)) return resolved;
             throw new Error("图片不存在、格式不受支持或超过 20 MB");
           }
           const mimeType = imageMimeType(resolved, result.mimeType);
           if (!mimeType) throw new Error("文件不是支持的图片格式");
+          entry.bytes = Math.ceil(result.contentsBase64.length * 0.75);
+          imageCacheBytes += entry.bytes;
+          while (imageCacheBytes > IMAGE_CACHE_MAX_BYTES && imageCache.size > 1) {
+            const oldestKey = imageCache.keys().next().value;
+            const oldest = imageCache.get(oldestKey);
+            imageCache.delete(oldestKey);
+            imageCacheBytes = Math.max(0, imageCacheBytes - (oldest?.bytes || 0));
+          }
           return `data:${mimeType};base64,${result.contentsBase64}`;
         })
         .catch((error) => {
-          imageCache.delete(key);
+          if (imageCache.get(key) === entry) {
+            imageCache.delete(key);
+            imageCacheBytes = Math.max(0, imageCacheBytes - entry.bytes);
+          }
           throw error;
         });
-      imageCache.set(key, pending);
-      return pending;
+      imageCache.set(key, entry);
+      return entry.promise;
     }
 
     function currentMainModuleUrl() {
@@ -2270,6 +2331,7 @@ const FEATURES = {
             0,
           ),
           cachedImages: imageCache.size,
+          cachedImageBytes: imageCacheBytes,
           queuedImageReads: imageReadQueue.length,
           activeImageReads,
           nativeKatexLoaded: !!katexPromise && !lastError,
@@ -2291,6 +2353,7 @@ const FEATURES = {
         imageReadQueue.shift().reject(new Error("图片预览已停止"));
       }
       imageCache.clear();
+      imageCacheBytes = 0;
       style.remove();
       delete window.__bennettMarkdownPreviewMath;
     };
@@ -2366,18 +2429,19 @@ const FEATURES = {
       for (const c of CONTAINS) if (text.includes(c)) return true;
       return false;
     };
-    const scan = () => {
-      const candidates = document.querySelectorAll(
-        'button, a, [role="button"], [role="menuitem"]',
-      );
+    const CANDIDATE_SELECTOR = 'button, a, [role="button"], [role="menuitem"]';
+    const scanRoot = (root) => {
+      const candidates = [];
+      if (root instanceof Element && root.matches(CANDIDATE_SELECTOR)) candidates.push(root);
+      if (root?.querySelectorAll) candidates.push(...root.querySelectorAll(CANDIDATE_SELECTOR));
       for (const el of candidates) {
-        if (hidden.has(el)) continue;
         if (isInsideOurShell(el)) continue;
         const t = normText(el);
         if (t.length === 0 || t.length > 80) continue;
         if (!matches(el, t)) continue;
         const host = el.closest('[class*="rounded"], [class*="badge"]') || el;
         if (!(host instanceof HTMLElement)) continue;
+        if (hidden.has(host)) continue;
         host.dataset.codexppPrevDisplay = host.style.display || "";
         host.style.display = "none";
         hidden.add(host);
@@ -2385,12 +2449,38 @@ const FEATURES = {
       }
     };
 
-    scan();
-    const obs = new MutationObserver(scan);
+    let scanTimer = 0;
+    const pendingRoots = new Set();
+    const flushPendingRoots = () => {
+      scanTimer = 0;
+      const roots = Array.from(pendingRoots);
+      pendingRoots.clear();
+      for (const root of roots) scanRoot(root);
+    };
+    const scheduleRoots = (records) => {
+      for (const record of records) {
+        for (const node of record.addedNodes) {
+          const root = node instanceof Element ? node : node.parentElement;
+          if (root instanceof Element) pendingRoots.add(root);
+        }
+      }
+      if (!pendingRoots.size) return;
+      if (pendingRoots.size > 40) {
+        pendingRoots.clear();
+        pendingRoots.add(document.documentElement);
+      }
+      if (scanTimer) window.clearTimeout(scanTimer);
+      scanTimer = window.setTimeout(flushPendingRoots, 100);
+    };
+
+    scanRoot(document);
+    const obs = new MutationObserver(scheduleRoots);
     obs.observe(document.documentElement, { childList: true, subtree: true });
 
     return () => {
       obs.disconnect();
+      if (scanTimer) window.clearTimeout(scanTimer);
+      pendingRoots.clear();
       for (const el of hidden) {
         if ("codexppPrevDisplay" in el.dataset) {
           el.style.display = el.dataset.codexppPrevDisplay;
@@ -2426,7 +2516,7 @@ const FEATURES = {
      * `resetAt` is whatever Codex shows verbatim (typically "HH:MM",
      * or "Wed, HH:MM" for weekly API data).
      */
-    let snapshot = null; // Do not render persisted quota data before this page fetches fresh usage.
+    let snapshot = readSnapshot(api);
     let mounted = null; // HTMLElement currently rendered in the sidebar
     let directUsageAvailable = false;
     let directUsageInFlight = false;
@@ -2436,11 +2526,15 @@ const FEATURES = {
     let usageBridgeReadyLogged = false;
     let usageBridgeScriptInjected = false;
     let bridgeRequestSeq = 0;
+    let disposed = false;
     let lastMountedMode = null;
     let accountMode = "unknown"; // "official" | "api" | "unknown"
     let accountModeInFlight = false;
     let accountModeLastCheckedAt = 0;
     let accountModeLogged = false;
+    let accountModeCandidate = "unknown";
+    let accountModeCandidateCount = 0;
+    let accountModeCandidateAt = 0;
 
     const log = (...a) => api.log.info("[usage]", ...a);
     const ASIDE_SELECTOR = [
@@ -2475,6 +2569,7 @@ const FEATURES = {
     };
 
     const applySnapshot = (partial, source) => {
+      if (disposed) return false;
       if (
         !partial?.fiveHour &&
         !partial?.weekly &&
@@ -2526,7 +2621,7 @@ const FEATURES = {
             hasElectronBridge: typeof window.electronBridge?.sendMessageFromView === "function",
           },
         }));
-        window.addEventListener("codexpp-usage-request", (event) => {
+        const onRequest = (event) => {
           const message = event.detail;
           if (!message || typeof message !== "object" || !message.requestId) return;
           pending.add(message.requestId);
@@ -2541,8 +2636,8 @@ const FEATURES = {
           });
           if (forwarded) forwardedEvent.__codexForwardedViaBridge = true;
           window.dispatchEvent(forwardedEvent);
-        });
-        window.addEventListener("message", (event) => {
+        };
+        const onMessage = (event) => {
           const data = event.data;
           if (
             !data ||
@@ -2560,34 +2655,35 @@ const FEATURES = {
             type: "codexpp-usage-response",
             detail: data,
           }, "*");
-        });
+        };
+        const stop = () => {
+          window.removeEventListener("codexpp-usage-request", onRequest);
+          window.removeEventListener("message", onMessage);
+          window.__codexppUsageBridgeInstalled = false;
+        };
+        window.addEventListener("codexpp-usage-request", onRequest);
+        window.addEventListener("message", onMessage);
+        window.addEventListener("codexpp-usage-bridge-stop", stop, { once: true });
       })();`;
       (document.head || document.documentElement).appendChild(script);
       script.remove();
     };
 
     const dispatchCodexViewMessage = (message) => {
-      ensureUsageBridgeScript();
-      window.dispatchEvent(
-        new CustomEvent("codexpp-usage-request", { detail: message }),
-      );
-
-      let forwarded = false;
       const bridge = window.electronBridge;
       if (typeof bridge?.sendMessageFromView === "function") {
-        forwarded = true;
         bridge.sendMessageFromView(message).catch((e) => {
           if (!directUsageFailureLogged) {
             directUsageFailureLogged = true;
             api.log.warn("[usage] bridge send failed", e);
           }
         });
+        return;
       }
-      const event = new CustomEvent("codex-message-from-view", {
-        detail: message,
-      });
-      if (forwarded) event.__codexForwardedViaBridge = true;
-      window.dispatchEvent(event);
+      ensureUsageBridgeScript();
+      window.dispatchEvent(
+        new CustomEvent("codexpp-usage-request", { detail: message }),
+      );
     };
 
     const fetchCodexAppServerJson = async (url, timeoutMs = 10_000) => {
@@ -2668,11 +2764,18 @@ const FEATURES = {
 
     const bridgePostJson = async (path, payload = {}, timeoutMs = 2_500) => {
       const bridge = window.__codexSessionDeleteBridge;
-      if (typeof bridge !== "function") return null;
-      return await Promise.race([
-        bridge(path, payload),
-        new Promise((resolve) => window.setTimeout(() => resolve(null), timeoutMs)),
-      ]);
+      if (disposed || typeof bridge !== "function") return null;
+      let timeout = 0;
+      try {
+        return await Promise.race([
+          bridge(path, payload),
+          new Promise((resolve) => {
+            timeout = window.setTimeout(() => resolve(null), timeoutMs);
+          }),
+        ]);
+      } finally {
+        if (timeout) window.clearTimeout(timeout);
+      }
     };
 
     const activeRelayProfile = (settings) => {
@@ -2710,8 +2813,9 @@ const FEATURES = {
       accountModeInFlight = true;
       try {
         let nextMode = "unknown";
-        let settingsMode = "unknown";
+        let explicitMode = false;
         const settings = await bridgePostJson("/settings/get", {});
+        if (disposed) return accountMode;
         const profile = activeRelayProfile(settings);
         const relayMode = fieldValue(profile, "relayMode", "relay_mode");
         const officialMixApiKey = !!fieldValue(profile, "officialMixApiKey", "official_mix_api_key");
@@ -2721,38 +2825,70 @@ const FEATURES = {
         );
         if (relayMode === "official" && !officialMixApiKey) {
           nextMode = "official";
+          explicitMode = true;
         } else if (relayMode === "pureApi" || relayMode === "pure_api") {
           nextMode = "api";
+          explicitMode = true;
         } else if (relayMode === "mixedApi" || relayMode === "mixed_api" || officialMixApiKey) {
           nextMode = "api";
+          explicitMode = true;
         } else if (!relayMode && legacyApiConfigured) {
           nextMode = "api";
+          explicitMode = true;
         }
 
         if (nextMode === "unknown") {
           const catalog = await bridgePostJson("/codex-model-catalog", {});
+          if (disposed) return accountMode;
           if (catalogLooksLikeApiMode(catalog)) nextMode = "api";
           else if (catalog?.model_provider === "openai" || catalog?.provider_name === "openai") {
             nextMode = "official";
           }
         }
-        if (nextMode === "unknown") nextMode = settingsMode;
+        if (nextMode === "unknown") return accountMode;
 
-        if (nextMode !== "unknown" && nextMode !== accountMode) {
-          accountMode = nextMode;
-          if (accountMode === "api") {
-            snapshot = {
-              fiveHour: { label: "API", pct: null, resetAt: null, apiMode: true },
-              weekly: null,
-              at: Date.now(),
-              apiMode: true,
-            };
-          } else if (snapshot?.apiMode) {
-            snapshot = null;
-          }
-          ensureMounted(true);
+        // Catalog responses can briefly reflect the previous provider while
+        // Codex is switching accounts. Require two matching non-explicit
+        // observations before changing the visible mode.
+        if (nextMode === accountMode) {
+          accountModeCandidate = "unknown";
+          accountModeCandidateCount = 0;
+          accountModeCandidateAt = 0;
+          return accountMode;
         }
-        if (!accountModeLogged && accountMode !== "unknown") {
+        if (accountMode !== "unknown" || !explicitMode) {
+          if (
+            accountModeCandidate === nextMode &&
+            now - accountModeCandidateAt < 45_000
+          ) {
+            accountModeCandidateCount += 1;
+          } else {
+            accountModeCandidate = nextMode;
+            accountModeCandidateCount = 1;
+            accountModeCandidateAt = now;
+          }
+          if (accountModeCandidateCount < 2) return accountMode;
+        }
+
+        accountModeCandidate = "unknown";
+        accountModeCandidateCount = 0;
+        accountModeCandidateAt = 0;
+        accountMode = nextMode;
+        if (accountMode === "api") {
+          snapshot = {
+            fiveHour: { label: "API", pct: null, resetAt: null, apiMode: true },
+            weekly: null,
+            at: Date.now(),
+            apiMode: true,
+          };
+        } else {
+          // Keep the last stable value visible while the official snapshot
+          // refreshes. Clearing here caused the control to flash "—".
+          directUsageAvailable = false;
+          directUsageLastAttemptAt = 0;
+        }
+        ensureMounted(true);
+        if (!accountModeLogged) {
           accountModeLogged = true;
           log("account mode", accountMode);
         }
@@ -2947,7 +3083,8 @@ const FEATURES = {
     };
 
     const refreshUsageFromApi = async () => {
-      if ((await refreshAccountMode()) !== "official") return false;
+      if (disposed) return false;
+      if ((await refreshAccountMode()) === "api" || disposed) return false;
       if (directUsageInFlight) return false;
       const now = Date.now();
       if (directUsageLastAttemptAt && now - directUsageLastAttemptAt < 15_000) {
@@ -2957,6 +3094,7 @@ const FEATURES = {
       directUsageInFlight = true;
       try {
         const status = await fetchCodexAppServerJson("/wham/usage");
+        if (disposed) return false;
         const partial = snapshotFromUsageStatus(status);
         if (partial.fiveHour || partial.weekly) {
           directUsageAvailable = true;
@@ -3208,6 +3346,14 @@ const FEATURES = {
     };
 
     const findUsageSidebar = () => {
+      const primarySidebar = Array.from(document.querySelectorAll(ASIDE_SELECTOR))
+        .find((sidebar) => {
+          if (!(sidebar instanceof HTMLElement) || !isVisibleElement(sidebar)) return false;
+          if (looksLikeSettingsSidebar(sidebar)) return false;
+          const rect = sidebar.getBoundingClientRect();
+          return rect.width >= 150 && rect.height >= 300;
+        });
+      if (primarySidebar instanceof HTMLElement) return primarySidebar;
       const candidates = new Set(
         Array.from(document.querySelectorAll(SIDEBAR_CANDIDATE_SELECTOR))
           .filter((node) => node instanceof HTMLElement),
@@ -3282,24 +3428,6 @@ const FEATURES = {
     const isUsageControlNode = (node) =>
       node.closest?.('[data-codexpp="usage-slot"], [data-codexpp="usage-box"], [data-codexpp="usage-boxes"]');
 
-    const rowControls = (row) =>
-      Array.from(row.querySelectorAll('button, a, [role="button"]'))
-        .filter((control) =>
-          control instanceof HTMLElement &&
-          isVisibleElement(control) &&
-          !isUsageControlNode(control),
-        );
-
-    const isSlotAfterRightmostControl = (slot) => {
-      const row = slot.parentElement;
-      if (!(row instanceof HTMLElement)) return false;
-      const controls = rowControls(row);
-      if (!controls.length) return true;
-      const slotRect = slot.getBoundingClientRect();
-      const rightmostControl = Math.max(...controls.map((control) => control.getBoundingClientRect().right));
-      return slotRect.right >= rightmostControl - 2;
-    };
-
     const nearestControlRow = (sidebar, button) => {
       const sidebarRect = sidebar.getBoundingClientRect();
       let row = button.parentElement;
@@ -3316,7 +3444,7 @@ const FEATURES = {
           insideSidebar &&
           nearBottom &&
           rect.height > 0 &&
-          rect.height <= 88 &&
+          rect.height <= 128 &&
           (style.display === "flex" || style.display === "grid" || buttonCount >= 2);
         if (looksLikeControlLayer) return row;
         row = row.parentElement;
@@ -3361,16 +3489,29 @@ const FEATURES = {
       return slot;
     };
 
+    const createFallbackSlot = (sidebar) => {
+      const existing = sidebar.querySelector(':scope > [data-codexpp="usage-slot"]');
+      if (existing instanceof HTMLElement) return existing;
+      const slot = document.createElement("div");
+      slot.dataset.codexpp = "usage-slot";
+      slot.dataset.codexppUsageSlot = "sidebar-floating-fallback";
+      slot.className = "flex items-center";
+      slot.style.position = "absolute";
+      slot.style.right = "0.75rem";
+      slot.style.bottom = "0.75rem";
+      slot.style.zIndex = "30";
+      sidebar.appendChild(slot);
+      return slot;
+    };
+
     const findSidebarSlot = () => {
       const sidebar = findUsageSidebar();
       if (!sidebar) return null;
       for (const slot of sidebar.querySelectorAll('[data-codexpp="usage-slot"]')) {
-        const row = slot.parentElement;
         if (
           !(slot instanceof HTMLElement) ||
-          !(row instanceof HTMLElement) ||
-          !isNearSidebarBottom(sidebar, row) ||
-          !isSlotAfterRightmostControl(slot)
+          !(slot.parentElement instanceof HTMLElement) ||
+          !slot.isConnected
         ) {
           slot.remove();
         }
@@ -3379,8 +3520,7 @@ const FEATURES = {
         .find((slot) =>
           slot instanceof HTMLElement &&
           slot.parentElement instanceof HTMLElement &&
-          isNearSidebarBottom(sidebar, slot.parentElement) &&
-          isSlotAfterRightmostControl(slot),
+          slot.isConnected,
         );
       if (existingSlot instanceof HTMLElement) return existingSlot;
 
@@ -3389,7 +3529,6 @@ const FEATURES = {
           button instanceof HTMLElement &&
           isVisibleElement(button) &&
           isNearSidebarBottom(sidebar, button) &&
-          !button.closest("section") &&
           !isUsageControlNode(button),
         );
       const deviceControls = controls.filter(isDeviceButton);
@@ -3432,7 +3571,7 @@ const FEATURES = {
         if (row) return createInlineSlot(row, anchor);
       }
 
-      return null;
+      return createFallbackSlot(sidebar);
     };
 
     const displaySnapshot = () =>
@@ -3455,9 +3594,9 @@ const FEATURES = {
           };
 
     const ensureMounted = (forceRebuild = false) => {
+      if (disposed) return;
       const visibleSnapshot = displaySnapshot();
       const slot = findSidebarSlot();
-      document.querySelectorAll('[data-codexpp="usage-floating-slot"]').forEach((node) => node.remove());
       if (!slot) {
         if (mounted) {
           mounted.remove();
@@ -3470,6 +3609,11 @@ const FEATURES = {
         }
         if (!ensureMounted._warned) {
           log("ensureMounted: no sidebar slot found yet");
+          if (typeof reportLifecycle === "function") {
+            reportLifecycle("usage-slot-missing", {
+              asideCount: document.querySelectorAll("aside").length,
+            });
+          }
           ensureMounted._warned = true;
         }
         return;
@@ -3506,6 +3650,11 @@ const FEATURES = {
         slotTag: slot.tagName,
         slotClass: slot.className,
       });
+      if (typeof reportLifecycle === "function") {
+        reportLifecycle("usage-mounted", {
+          mode: slot.dataset.codexppUsageSlot || "unknown",
+        });
+      }
     };
 
     // Initial render from persisted snapshot (so first paint isn't empty
@@ -3513,29 +3662,44 @@ const FEATURES = {
     ensureMounted(true);
 
     // ── observers ─────────────────────────────────────────────────────
-    // We throttle to one tick per animation frame so a flood of React
-    // re-renders can't tank the renderer (Codex mutates the DOM heavily
-    // while typing). Coalesces N onMutate() calls into one scan.
+    // React can emit hundreds of mutations while restoring the history list.
+    // Ignore our own UI and editor churn, then coalesce the rest into one scan.
     let scheduled = false;
+    let scheduleTimer = 0;
+    const runMutationScan = async () => {
+      if (disposed) return;
+      const mode = await refreshAccountMode();
+      if (disposed) return;
+      if (mode !== "api") await refreshUsageFromApi();
+      if (disposed) return;
+      if (accountMode !== "api" && !directUsageAvailable) {
+        const grid = findBreakdownGrid();
+        if (grid) scanBreakdown(grid);
+        scanCompactUsage();
+      }
+      ensureMounted();
+    };
     const onMutate = () => {
       if (scheduled) return;
       scheduled = true;
-      requestAnimationFrame(() => {
+      scheduleTimer = window.setTimeout(() => {
+        scheduleTimer = 0;
         scheduled = false;
-        refreshAccountMode().then((mode) => {
-          if (mode === "official") refreshUsageFromApi();
-        });
-        if (accountMode === "official" && !directUsageAvailable) {
-          const grid = findBreakdownGrid();
-          if (grid) scanBreakdown(grid);
-          scanCompactUsage();
-        }
-        ensureMounted();
-      });
+        void runMutationScan();
+      }, 1000);
     };
 
     onMutate();
-    const obs = new MutationObserver(onMutate);
+    const IGNORED_MUTATION_SELECTOR =
+      "[data-codexpp], [data-codex-composer-root], [data-codex-composer='true'], [contenteditable='true'], textarea, [data-composer-overlay-floating-ui]";
+    const obs = new MutationObserver((records) => {
+      const relevant = records.some((record) => {
+        const target = record.target;
+        const element = target instanceof Element ? target : target?.parentElement;
+        return !(element instanceof Element && element.closest(IGNORED_MUTATION_SELECTOR));
+      });
+      if (relevant) onMutate();
+    });
     obs.observe(document.documentElement, { childList: true, subtree: true });
     const interval = window.setInterval(onMutate, 15_000);
     window.addEventListener("focus", onMutate);
@@ -3545,8 +3709,13 @@ const FEATURES = {
     log("active", { snapshot });
 
     return () => {
+      disposed = true;
+      if (usageBridgeScriptInjected) {
+        window.dispatchEvent(new CustomEvent("codexpp-usage-bridge-stop"));
+      }
       obs.disconnect();
       window.clearInterval(interval);
+      if (scheduleTimer) window.clearTimeout(scheduleTimer);
       window.removeEventListener("focus", onMutate);
       window.removeEventListener("message", onUsageMessage);
       document.removeEventListener("visibilitychange", onMutate);
@@ -6969,25 +7138,46 @@ const FEATURES = {
       activeOriginals = originals;
     };
 
-    let scheduled = false;
-    const scheduleApply = () => {
-      if (scheduled) return;
-      scheduled = true;
-      requestAnimationFrame(() => {
-        scheduled = false;
+    let applyTimer = 0;
+    const scheduleApply = (delay = 120) => {
+      if (applyTimer) window.clearTimeout(applyTimer);
+      applyTimer = window.setTimeout(() => {
+        applyTimer = 0;
         apply();
+      }, delay);
+    };
+    const mutationsTouchActions = (records) => {
+      if (!activeOriginals.length || activeOriginals.some((node) => !node.isConnected)) {
+        return true;
+      }
+      return records.some((record) => {
+        const target = record.target instanceof Element
+          ? record.target
+          : record.target?.parentElement;
+        if (
+          target instanceof Element &&
+          activeOriginals.some((button) => target === button || target.contains(button) || button.contains(target))
+        ) {
+          return true;
+        }
+        return [...record.addedNodes, ...record.removedNodes].some((node) =>
+          node instanceof Element && activeOriginals.some((button) => node === button || node.contains(button)),
+        );
       });
     };
 
     clearStaleNodes();
     apply();
-    const obs = new MutationObserver(scheduleApply);
+    const obs = new MutationObserver((records) => {
+      if (mutationsTouchActions(records)) scheduleApply();
+    });
     obs.observe(document.body, { childList: true, subtree: true });
 
     api.log.info("sidebar action grid active");
 
     return () => {
       obs.disconnect();
+      if (applyTimer) window.clearTimeout(applyTimer);
       removeWrapper();
       cleanupMarks();
       style.remove();
@@ -7771,9 +7961,10 @@ const FEATURES = {
       markRows(rows);
     };
 
-
+    let activeSidebar = null;
     const apply = () => {
       const sidebar = mainSidebar();
+      activeSidebar = sidebar instanceof HTMLElement ? sidebar : null;
       if (!sidebar) {
         return;
       }
@@ -7835,15 +8026,10 @@ const FEATURES = {
     };
 
     let scheduled = false;
-    let scheduleFrame = 0;
     let scheduleTimer = 0;
     const runScheduledApply = () => {
       if (!scheduled) return;
       scheduled = false;
-      if (scheduleFrame) {
-        cancelAnimationFrame(scheduleFrame);
-        scheduleFrame = 0;
-      }
       if (scheduleTimer) {
         window.clearTimeout(scheduleTimer);
         scheduleTimer = 0;
@@ -7852,20 +8038,33 @@ const FEATURES = {
       apply();
     };
 
-    const scheduleApply = () => {
-      if (scheduled || disposed) return;
+    const scheduleApply = (delay = 140) => {
+      if (disposed) return;
       scheduled = true;
-      scheduleFrame = requestAnimationFrame(runScheduledApply);
-      scheduleTimer = window.setTimeout(runScheduledApply, 80);
+      if (scheduleTimer) window.clearTimeout(scheduleTimer);
+      scheduleTimer = window.setTimeout(runScheduledApply, delay);
     };
 
-    let childListFrame = 0;
-    const scheduleApplySoon = () => {
-      if (disposed || childListFrame) return;
-      childListFrame = requestAnimationFrame(() => {
-        childListFrame = 0;
-        scheduleApply();
+    const scheduleApplyForMutations = (records) => {
+      if (disposed) return;
+      const sidebar = activeSidebar?.isConnected ? activeSidebar : null;
+      const relevant = records.some((record) => {
+        const target = record.target instanceof Element
+          ? record.target
+          : record.target?.parentElement;
+        if (sidebar && target instanceof Element && (target === sidebar || sidebar.contains(target))) {
+          return true;
+        }
+        return [...record.addedNodes, ...record.removedNodes].some((node) =>
+          node instanceof Element && (
+            node.matches?.(ASIDE_SELECTOR) ||
+            node.querySelector?.(ASIDE_SELECTOR) ||
+            node.hasAttribute?.("data-app-action-sidebar-project-id") ||
+            node.querySelector?.("[data-app-action-sidebar-project-id]")
+          ),
+        );
       });
+      if (relevant) scheduleApply();
     };
 
     apply();
@@ -7873,20 +8072,16 @@ const FEATURES = {
     const retryTimers = [250, 1000, 2500].map((delay) =>
       window.setTimeout(scheduleApply, delay),
     );
-    const observer = new MutationObserver(scheduleApplySoon);
+    const observer = new MutationObserver(scheduleApplyForMutations);
     observer.observe(document.body, {
       attributes: true,
       attributeFilter: [
         "aria-label",
-        "class",
         "data-app-action-sidebar-project-collapsed",
         "data-app-action-sidebar-project-id",
         "data-app-action-sidebar-project-label",
         "data-app-action-sidebar-project-row",
-        "data-codexpp-sidebar-project-expanded",
-        ATTR,
         "role",
-        "style",
       ],
       childList: true,
       subtree: true,
@@ -7894,23 +8089,23 @@ const FEATURES = {
     document.addEventListener("contextmenu", onProjectContextMenu, true);
     document.addEventListener("pointerdown", onProjectOverflowTrigger, true);
     document.addEventListener("click", onProjectOverflowTrigger, true);
-    window.addEventListener("focus", scheduleApply);
-    document.addEventListener("visibilitychange", scheduleApply);
+    const onWindowFocus = () => scheduleApply();
+    const onVisibilityChange = () => scheduleApply();
+    window.addEventListener("focus", onWindowFocus);
+    document.addEventListener("visibilitychange", onVisibilityChange);
 
     api.log.info("sidebar project backgrounds active");
 
     return () => {
       disposed = true;
       observer.disconnect();
-      if (childListFrame) cancelAnimationFrame(childListFrame);
-      if (scheduleFrame) cancelAnimationFrame(scheduleFrame);
       if (scheduleTimer) window.clearTimeout(scheduleTimer);
       retryTimers.forEach((timer) => window.clearTimeout(timer));
       document.removeEventListener("contextmenu", onProjectContextMenu, true);
       document.removeEventListener("pointerdown", onProjectOverflowTrigger, true);
       document.removeEventListener("click", onProjectOverflowTrigger, true);
-      window.removeEventListener("focus", scheduleApply);
-      document.removeEventListener("visibilitychange", scheduleApply);
+      window.removeEventListener("focus", onWindowFocus);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
       closeMenu();
       clearMarks();
       style.remove();
@@ -8209,6 +8404,7 @@ function renderUsageBox(api, snapshot) {
     if (k === "weekly") return snap.weekly;
     return snap.points;
   };
+  const isApiSnapshot = (snap) => !!snap?.apiMode || !!snap?.fiveHour?.apiMode;
 
   /** Apply colors + text for the *value* state (i.e. not hover). */
   const applyValueState = (snap) => {
@@ -8481,7 +8677,15 @@ function switchControl(initial, onChange) {
       status: "可用",
     },
   ];
-  const settingsObserver = new MutationObserver(installSettingsPanel);
+  let settingsScanTimer = 0;
+  const scheduleSettingsPanelInstall = () => {
+    if (settingsScanTimer) return;
+    settingsScanTimer = window.setTimeout(() => {
+      settingsScanTimer = 0;
+      installSettingsPanel();
+    }, 100);
+  };
+  const settingsObserver = new MutationObserver(scheduleSettingsPanelInstall);
   settingsObserver.observe(document.documentElement, { childList: true, subtree: true });
   installSettingsPanel();
 
@@ -8510,14 +8714,24 @@ function switchControl(initial, onChange) {
 
   function installSettingsPanel() {
     const modal = document.querySelector(".codex-plus-modal-content");
-    if (!modal || modal.dataset.bennettUiSettingsVersion === VERSION) return;
+    if (!modal) return;
     const tabs = modal.querySelector(".codex-plus-tabs");
     const body = modal.querySelector(".codex-plus-modal-body");
     if (!tabs || !body) return;
+    const currentTab = tabs.querySelector('[data-codex-plus-tab="bennettUi"]');
+    const currentPanel = body.querySelector('[data-codex-plus-panel="bennettUi"]');
+    if (
+      modal.dataset.bennettUiSettingsLoadId === SCRIPT_LOAD_ID &&
+      currentTab &&
+      currentPanel
+    ) {
+      return;
+    }
     modal.dataset.bennettUiSettingsVersion = VERSION;
+    modal.dataset.bennettUiSettingsLoadId = SCRIPT_LOAD_ID;
 
-    tabs.querySelector('[data-codex-plus-tab="bennettUi"]')?.remove();
-    body.querySelector('[data-codex-plus-panel="bennettUi"]')?.remove();
+    tabs.querySelectorAll('[data-codex-plus-tab="bennettUi"]').forEach((node) => node.remove());
+    body.querySelectorAll('[data-codex-plus-panel="bennettUi"]').forEach((node) => node.remove());
 
     const tab = document.createElement("button");
     tab.type = "button";
@@ -8534,6 +8748,13 @@ function switchControl(initial, onChange) {
     panel.innerHTML = settingsPanelHtml();
     panel.addEventListener("click", (event) => {
       const target = event.target instanceof Element ? event.target : event.target?.parentElement;
+      const historyLoad = target?.closest("[data-bennett-ui-history-load]");
+      if (historyLoad) {
+        event.preventDefault();
+        event.stopPropagation();
+        void loadHistoryFromSettings(panel);
+        return;
+      }
       const toggle = target?.closest("[data-bennett-ui-feature]");
       if (!toggle) return;
       event.preventDefault();
@@ -8552,9 +8773,8 @@ function switchControl(initial, onChange) {
     return `
       <div class="codex-plus-row bennett-ui-settings-head">
         <div>
-          <div class="codex-plus-row-title">Bennett UI Improvements</div>
-          <div class="codex-plus-row-description">来源：b-nnett/codex-plusplus-bennett-ui。此迁移只保留能够在 BigPizzaV3 renderer-only 用户脚本环境中运行的功能。</div>
-          <div class="bennett-ui-settings-note">切换会尽量立即生效。如果 Codex DOM 变动导致残留，可重新加载用户脚本或重启 Codex++。</div>
+          <div class="codex-plus-row-title">Bennett UI Improvements ${escapeHtmlLocal(VERSION)}</div>
+          <div class="codex-plus-row-description">项目侧栏、额度显示、Markdown 预览与原生会话查询上限设置。</div>
         </div>
       </div>
       ${featureInfo.map((item) => `
@@ -8567,7 +8787,67 @@ function switchControl(initial, onChange) {
           <button type="button" class="codex-plus-toggle bennett-ui-toggle" data-bennett-ui-feature="${escapeAttr(item.id)}" ${item.disabled ? "disabled" : ""}><span></span></button>
         </div>
       `).join("")}
+      <div class="codex-plus-row bennett-ui-history-row" data-bennett-ui-history-row="true">
+        <div class="bennett-ui-history-copy">
+          <div class="codex-plus-row-title">会话历史加载</div>
+          <div class="codex-plus-row-description">仅提高 Codex 原生近期会话查询上限，不扫描、合并、补写或重新渲染会话。每次打开 Codex 后自动请求一次，也可手动重试。范围 ${HISTORY_TARGET_MIN}–${HISTORY_TARGET_MAX} 条。</div>
+          <div class="bennett-ui-feature-status" data-bennett-ui-history-status="true">由 Codex 原生读取和渲染；启动后自动请求</div>
+        </div>
+        <div class="bennett-ui-history-controls">
+          <input type="number" min="${HISTORY_TARGET_MIN}" max="${HISTORY_TARGET_MAX}" step="50" value="${readHistoryTarget()}" inputmode="numeric" aria-label="历史会话查询上限" data-bennett-ui-history-limit="true">
+          <button type="button" class="bennett-ui-history-load" data-bennett-ui-history-load="true">重新加载历史</button>
+        </div>
+      </div>
     `;
+  }
+
+  function normalizeHistoryTarget(value, fallback = HISTORY_TARGET_DEFAULT) {
+    const parsed = Number.parseInt(String(value ?? ""), 10);
+    if (!Number.isFinite(parsed)) return fallback;
+    return Math.max(HISTORY_TARGET_MIN, Math.min(HISTORY_TARGET_MAX, parsed));
+  }
+
+  function readHistoryTarget() {
+    try {
+      return normalizeHistoryTarget(window.localStorage.getItem(HISTORY_TARGET_STORAGE_KEY));
+    } catch {
+      return HISTORY_TARGET_DEFAULT;
+    }
+  }
+
+  function writeHistoryTarget(value) {
+    const normalized = normalizeHistoryTarget(value);
+    try {
+      window.localStorage.setItem(HISTORY_TARGET_STORAGE_KEY, String(normalized));
+    } catch {
+      // The loader can still use the value for this run when storage is unavailable.
+    }
+    return normalized;
+  }
+
+  async function loadHistoryFromSettings(panel) {
+    const input = panel.querySelector("[data-bennett-ui-history-limit]");
+    const button = panel.querySelector("[data-bennett-ui-history-load]");
+    const status = panel.querySelector("[data-bennett-ui-history-status]");
+    const limit = writeHistoryTarget(input?.value);
+    if (input) input.value = String(limit);
+    if (button) button.disabled = true;
+    if (status) status.textContent = `正在请求 Codex 原生历史，上限 ${limit} 条…`;
+    try {
+      const loader = window.__bennettUiEmbeddedHistoryLoader || window.__codexListPagebuster;
+      if (!loader || typeof loader.refresh !== "function") {
+        throw new Error("内置会话加载器尚未就绪，请稍后重试");
+      }
+      loader.setLimit?.(limit);
+      await loader.refresh(limit);
+      if (status) {
+        status.textContent = `已请求 Codex 原生历史，上限 ${limit} 条；侧栏由 Codex 自己渲染`;
+      }
+    } catch (error) {
+      if (status) status.textContent = `加载失败：${error?.message || String(error)}`;
+    } finally {
+      if (button) button.disabled = false;
+    }
   }
 
   function refreshSettingsPanel() {
@@ -8586,15 +8866,25 @@ function switchControl(initial, onChange) {
     const style = document.createElement("style");
     style.id = "bennett-ui-settings-style";
     style.textContent = `
+      [data-codex-plus-panel="bennettUi"] {
+        color: #f3f4f6 !important;
+        color-scheme: dark;
+      }
+      [data-codex-plus-panel="bennettUi"] .codex-plus-row-title {
+        color: #f3f4f6 !important;
+      }
+      [data-codex-plus-panel="bennettUi"] .codex-plus-row-description {
+        color: #a1a1aa !important;
+      }
       .bennett-ui-settings-note,
       .bennett-ui-feature-status {
         margin-top: 6px;
-        color: var(--text-secondary, var(--color-token-text-secondary, #8b8b8b));
+        color: #a1a1aa !important;
         font-size: 12px;
         line-height: 1.35;
       }
       .bennett-ui-feature-row[data-enabled="true"] .bennett-ui-feature-status {
-        color: var(--text-primary, var(--color-token-text-primary, #f5f5f5));
+        color: #d1d5db !important;
       }
       .bennett-ui-toggle[disabled] {
         cursor: not-allowed;
@@ -8602,6 +8892,56 @@ function switchControl(initial, onChange) {
       }
       .bennett-ui-toggle[data-enabled="true"] span {
         transform: translateX(14px);
+      }
+      .bennett-ui-history-row {
+        align-items: center;
+        gap: 18px;
+      }
+      .bennett-ui-history-copy {
+        min-width: 0;
+        flex: 1 1 auto;
+      }
+      .bennett-ui-history-controls {
+        display: flex;
+        flex: 0 0 auto;
+        align-items: center;
+        gap: 10px;
+      }
+      .bennett-ui-history-controls input {
+        box-sizing: border-box;
+        width: 130px;
+        min-height: 34px;
+        border: 1px solid var(--border-default, rgba(127, 127, 127, 0.45));
+        border-radius: 8px;
+        background: var(--background-primary, color-mix(in srgb, currentColor 6%, transparent));
+        color: #f3f4f6;
+        padding: 5px 10px;
+      }
+      .bennett-ui-history-load {
+        min-height: 34px;
+        border: 1px solid var(--border-default, rgba(127, 127, 127, 0.45));
+        border-radius: 8px;
+        background: var(--background-secondary, color-mix(in srgb, currentColor 9%, transparent));
+        color: #f3f4f6;
+        cursor: pointer;
+        padding: 5px 12px;
+      }
+      .bennett-ui-history-load:hover:not(:disabled) {
+        background: var(--background-tertiary, color-mix(in srgb, currentColor 15%, transparent));
+      }
+      .bennett-ui-history-load:disabled {
+        cursor: wait;
+        opacity: 0.55;
+      }
+      @media (max-width: 720px) {
+        .bennett-ui-history-row,
+        .bennett-ui-history-controls {
+          align-items: stretch;
+          flex-direction: column;
+        }
+        .bennett-ui-history-controls input {
+          width: 100%;
+        }
       }
     `;
     document.head.appendChild(style);
@@ -8628,22 +8968,60 @@ function switchControl(initial, onChange) {
 
   window[INSTALL_KEY] = {
     version: VERSION,
+    scriptLoadId: SCRIPT_LOAD_ID,
     api,
     features,
     featureInfo,
-    setFeature(id, enabled, reload = true) {
+    setFeature(id, enabled, reload = false) {
       setFeatureEnabled(id, enabled);
       if (reload) window.location.reload();
     },
     stop() {
+      for (const timer of lifecycleTimers) window.clearTimeout(timer);
+      lifecycleTimers.clear();
+      const embeddedHistory = window.__bennettUiEmbeddedHistoryLoader;
+      if (embeddedHistory && typeof embeddedHistory.stop === "function") {
+        try {
+          embeddedHistory.stop();
+        } catch (error) {
+          console.warn("[Bennett UI/BigPizza] history stop failed", error);
+        }
+      }
+      if (window.__bennettUiEmbeddedHistoryLoader === embeddedHistory) {
+        delete window.__bennettUiEmbeddedHistoryLoader;
+      }
+      if (window.__codexListPagebuster === embeddedHistory) {
+        delete window.__codexListPagebuster;
+      }
       settingsObserver.disconnect();
-      document.querySelector('[data-codex-plus-tab="bennettUi"]')?.remove();
-      document.querySelector('[data-codex-plus-panel="bennettUi"]')?.remove();
+      if (settingsScanTimer) window.clearTimeout(settingsScanTimer);
+      document.querySelectorAll('[data-codex-plus-tab="bennettUi"]').forEach((node) => node.remove());
+      document.querySelectorAll('[data-codex-plus-panel="bennettUi"]').forEach((node) => node.remove());
+      const settingsModal = document.querySelector(".codex-plus-modal-content");
+      if (settingsModal?.dataset.bennettUiSettingsLoadId === SCRIPT_LOAD_ID) {
+        delete settingsModal.dataset.bennettUiSettingsLoadId;
+        delete settingsModal.dataset.bennettUiSettingsVersion;
+      }
+      document.getElementById("bennett-ui-settings-style")?.remove();
       if (typeof tweak.stop === "function") {
         tweak.stop.call(tweak);
       }
     },
   };
+
+  reportLifecycle("script-loaded", {
+    readyState: document.readyState,
+    activeFeatures: Array.from(tweak._state?.features?.keys?.() || []),
+  });
+  scheduleLifecycle(() => {
+    const usageBox = document.querySelector('[data-codexpp="usage-box"], [data-codexpp="usage-boxes"]');
+    reportLifecycle("script-settled", {
+      activeFeatures: Array.from(tweak._state?.features?.keys?.() || []),
+      usageMounted: Boolean(usageBox),
+      usageSlotMode: usageBox?.parentElement?.dataset?.codexppUsageSlot || "",
+      asideCount: document.querySelectorAll("aside").length,
+    });
+  }, 1500);
 
   function createBigPizzaRendererApi() {
     const storagePrefix = "bennett-ui-improvements:";
@@ -8707,33 +9085,20 @@ function switchControl(initial, onChange) {
 
 /* BEGIN BENNETT EMBEDDED NATIVE HISTORY LOADER */
 /*
- * Bennett UI embedded native history loader.
- * Derived from Codex List Pagebuster 0.2.2 and packaged into the Bennett UI
- * release artifact so users do not need to install a second script.
+ * Bennett UI native history limit helper.
+ *
+ * Its only responsibility is to ask Codex to refresh its own recent
+ * conversation list with a larger limit. Codex remains responsible for
+ * provider selection, storage, indexing, project grouping, pagination,
+ * pin/archive state, and sidebar rendering.
  */
 (() => {
   const DEFAULT_TARGET = 500;
   const MIN_TARGET = 1;
   const MAX_TARGET = 2000;
-  const CLI_PAGE_SIZE = 100;
-  const CLI_MAX_PAGES = Math.ceil(MAX_TARGET / CLI_PAGE_SIZE);
-  const NATIVE_HYDRATE_BATCH_SIZE = 10;
-  const NATIVE_MANAGER_SCAN_LIMIT = 150000;
-  const STARTUP_REFRESH_DELAYS_MS = [1800, 4000, 8000];
   const SCRIPT_KEY = "__codexListPagebuster";
-  const STORAGE_KEY = "__codexListPagebusterThreads";
-  const STORAGE_VERSION_KEY = "__codexListPagebusterStorageVersion";
-  const STORAGE_VERSION = "2026-06-01-global-history-v4";
   const TARGET_STORAGE_KEY = "__codexListPagebusterTarget";
-  const PROJECT_LIST_SELECTOR = "[data-app-action-sidebar-project-list-id]";
-  const THREAD_SELECTOR = "[data-app-action-sidebar-thread-id]";
-  const SUPPLEMENT_SELECTOR = "[data-clpb-history-section]";
-  const MANAGED_ROW_SELECTOR = "[data-clpb-managed-row]";
-  const PROJECT_SUPPLEMENT_ITEM_SELECTOR = "[data-clpb-project-supplemental-item]";
-  const EXPAND_TEXT = /^(?:\u5c55\u5f00\u663e\u793a|\u663e\u793a\u66f4\u591a|Show more|Show all)$/i;
-  const ARCHIVED_IDS_KEY = "__codexListPagebusterArchivedIds";
-  const HIDDEN_IDS_KEY = "__codexListPagebusterHiddenIds";
-  const GLOBAL_EXTRA_HISTORY = true;
+  const SCRIPT_LOAD_REFRESH_DELAYS_MS = [0, 1200, 3000, 6000];
   const SIGNALS_MODULE_RE = /(?:\.\/)?(?:assets\/)?(?:app-server-manager-signals|app-initial)-[A-Za-z0-9_-]+\.js/g;
   const SIGNALS_MODULE_FALLBACKS = [
     "./assets/app-server-manager-signals-Csopz8aM.js",
@@ -8745,33 +9110,16 @@ function switchControl(initial, onChange) {
   }
 
   const state = {
-    clicked: new WeakSet(),
-    scheduled: false,
-    autoExpandEnabled: true,
-    programmaticExpand: false,
-    projectClickListener: null,
-    autoExpandDeadlineMs: Date.now() + 8000,
-    lastProjectRoots: new Set(),
+    stopped: false,
     internalActionModulePromise: null,
-    snapshotRefreshInFlight: false,
-    lastSnapshotRefreshAt: 0,
-    lastSnapshotError: "",
-    nativeIdsRequested: 0,
-    nativeCachedThreads: 0,
-    nativeSummaryThreads: 0,
-    nativeMissingThreads: 0,
-    nativeManager: null,
-    nativeManagerPromise: null,
-    nativeRuntimeSettings: null,
-    nativeOriginalHistoryLimit: null,
-    nativeHistoryLimitGetter: null,
-    nativeHistoryLimit: DEFAULT_TARGET,
-    lastNativeLoadError: "",
-    startupRefreshTimer: 0,
-    startupRefreshAttempts: 0,
-    startupRefreshCompleted: false,
-    startupRefreshCount: 0,
-    lastStartupRefreshError: ""
+    startupTimers: new Set(),
+    startupAttempts: 0,
+    startupCompleted: false,
+    refreshInFlight: null,
+    refreshAttempts: 0,
+    lastRequestedLimit: 0,
+    lastRefreshAt: 0,
+    lastRefreshError: ""
   };
 
   function normalizeTarget(value, fallback = DEFAULT_TARGET) {
@@ -8792,356 +9140,22 @@ function switchControl(initial, onChange) {
     const target = normalizeTarget(value);
     try {
       localStorage.setItem(TARGET_STORAGE_KEY, String(target));
-    } catch {}
+    } catch {
+      // The value can still be used for the current refresh.
+    }
     return target;
   }
 
   function log(...args) {
     try {
-      console.info("[clpb]", ...args);
+      console.info("[Bennett history limit]", ...args);
     } catch {}
-  }
-
-  function isExpandButton(button) {
-    if (!(button instanceof HTMLButtonElement)) return false;
-    if (button.disabled || state.clicked.has(button)) return false;
-    return EXPAND_TEXT.test((button.textContent || "").trim());
-  }
-
-  function readSnapshotThreads() {
-    try {
-      const raw = localStorage.getItem(STORAGE_KEY);
-      const threads = raw ? JSON.parse(raw) : [];
-      const archivedIds = readArchivedIds();
-      const hiddenIds = readHiddenIds();
-      return Array.isArray(threads)
-        ? threads.filter((thread) => {
-            if (!thread || typeof thread.id !== "string") return false;
-            if (archivedIds.has(threadRawId(thread))) return false;
-            if (hiddenIds.has(threadRawId(thread))) return false;
-            const title = String(thread.title || "").trim();
-            const cwd = normalizeCwd(thread.cwd);
-            return Boolean(title || cwd);
-          })
-        : [];
-    } catch (error) {
-      log("snapshot read failed", String(error));
-      return [];
-    }
-  }
-
-  function readIdSet(key) {
-    try {
-      const raw = localStorage.getItem(key);
-      const ids = raw ? JSON.parse(raw) : [];
-      return new Set(Array.isArray(ids) ? ids.map(threadRawId).filter(Boolean) : []);
-    } catch {
-      return new Set();
-    }
-  }
-
-  function writeIdSet(key, ids, label) {
-    try {
-      localStorage.setItem(key, JSON.stringify(Array.from(ids)));
-    } catch (error) {
-      log(`${label} ids write failed`, String(error));
-    }
-  }
-
-  function readArchivedIds() {
-    return readIdSet(ARCHIVED_IDS_KEY);
-  }
-
-  function writeArchivedIds(ids) {
-    writeIdSet(ARCHIVED_IDS_KEY, ids, "archived");
-  }
-
-  function readHiddenIds() {
-    return readIdSet(HIDDEN_IDS_KEY);
-  }
-
-  function writeHiddenIds(ids) {
-    writeIdSet(HIDDEN_IDS_KEY, ids, "hidden");
-  }
-
-  function threadRawId(threadOrId) {
-    const id = typeof threadOrId === "string" ? threadOrId : threadOrId?.id;
-    return String(id || "").replace(/^local:/, "");
-  }
-
-  function threadDomId(threadOrId) {
-    return `local:${threadRawId(threadOrId)}`;
-  }
-
-  function normalizeCwd(cwd) {
-    return String(cwd || "")
-      .replace(/^\\\\\?\\/, "")
-      .replace(/\s+/g, " ")
-      .trim();
-  }
-
-  function normalizePathForCompare(path) {
-    return normalizeCwd(path)
-      .replace(/[\\/]+$/g, "")
-      .replaceAll("\\", "/")
-      .toLowerCase();
-  }
-
-  function basename(path) {
-    const normalized = normalizeCwd(path);
-    return normalized.split(/[\\/]/).filter(Boolean).pop() || normalized || "unknown";
-  }
-
-  function rememberProjectRoots(roots) {
-    const next = new Set(state.lastProjectRoots);
-    for (const root of roots) {
-      if (root) next.add(root);
-    }
-    state.lastProjectRoots = next;
-    return next;
-  }
-
-  function collectSnapshotProjectRoots() {
-    return new Set(
-      readSnapshotThreads()
-        .map((thread) => normalizePathForCompare(thread.cwd))
-        .filter(Boolean)
-    );
-  }
-
-  function writeSnapshotThreads(threads) {
-    try {
-      const archivedIds = readArchivedIds();
-      const hiddenIds = readHiddenIds();
-      const activeThreads = threads.filter((thread) => {
-        const rawId = threadRawId(thread);
-        return !archivedIds.has(rawId) && !hiddenIds.has(rawId);
-      });
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(activeThreads));
-    } catch (error) {
-      log("snapshot write failed", String(error));
-    }
-  }
-
-  function migrateStorageForGlobalHistory() {
-    try {
-      const version = localStorage.getItem(STORAGE_VERSION_KEY);
-      if (version === STORAGE_VERSION) return;
-      // Earlier builds could keep a current-project-only snapshot or hide
-      // old cross-project threads after a failed metadata check. Rebuild from
-      // the broad local CLI history on the next refresh.
-      localStorage.removeItem(STORAGE_KEY);
-      localStorage.removeItem(HIDDEN_IDS_KEY);
-      localStorage.setItem(STORAGE_VERSION_KEY, STORAGE_VERSION);
-      log("global history storage migrated", {
-        previousVersion: version || "(none)",
-        version: STORAGE_VERSION
-      });
-    } catch (error) {
-      log("global history storage migration failed", String(error));
-    }
-  }
-
-  function pruneSnapshotThreads(idsToRemove) {
-    const removeSet = new Set(Array.from(idsToRemove).map(threadRawId).filter(Boolean));
-    if (removeSet.size === 0) return 0;
-    const threads = readSnapshotThreads();
-    const next = threads.filter((thread) => !removeSet.has(threadRawId(thread)));
-    if (next.length === threads.length) return 0;
-    writeSnapshotThreads(next);
-    return threads.length - next.length;
-  }
-
-  function rememberArchivedIds(ids) {
-    const archivedIds = readArchivedIds();
-    let changed = false;
-    for (const id of ids) {
-      const rawId = threadRawId(id);
-      if (!rawId || archivedIds.has(rawId)) continue;
-      archivedIds.add(rawId);
-      changed = true;
-    }
-    if (changed) writeArchivedIds(archivedIds);
-    return archivedIds;
-  }
-
-  function rememberHiddenIds(ids) {
-    const hiddenIds = readHiddenIds();
-    let changed = false;
-    for (const id of ids) {
-      const rawId = threadRawId(id);
-      if (!rawId || hiddenIds.has(rawId)) continue;
-      hiddenIds.add(rawId);
-      changed = true;
-    }
-    if (changed) writeHiddenIds(hiddenIds);
-    return hiddenIds;
-  }
-
-  function snapshotProjectCounts(limit = 12) {
-    const counts = new Map();
-    for (const thread of readSnapshotThreads()) {
-      const label = basename(thread.cwd);
-      counts.set(label, (counts.get(label) || 0) + 1);
-    }
-    return Array.from(counts.entries())
-      .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
-      .slice(0, limit)
-      .map(([project, count]) => ({ project, count }));
-  }
-
-  function collectSidebarProjectBasenames() {
-    const basenames = new Set();
-    const add = (value) => {
-      const normalized = normalizePathForCompare(value);
-      if (!normalized) return;
-      const base = normalized.split("/").filter(Boolean).pop() || normalized;
-      if (base) basenames.add(base);
-    };
-    for (const row of document.querySelectorAll("[data-app-action-sidebar-project-id]")) {
-      add(row.getAttribute("data-app-action-sidebar-project-id"));
-    }
-    for (const projectList of document.querySelectorAll(PROJECT_LIST_SELECTOR)) {
-      add(projectList.getAttribute("data-app-action-sidebar-project-list-id"));
-    }
-    return basenames;
-  }
-
-  function collectVisibleProjectRoots() {
-    const roots = new Set();
-    const addRoot = (value) => {
-      const root = normalizePathForCompare(value);
-      if (root) roots.add(root);
-    };
-
-    for (const projectList of document.querySelectorAll(PROJECT_LIST_SELECTOR)) {
-      addRoot(projectList.getAttribute("data-app-action-sidebar-project-list-id"));
-    }
-
-    const projectIdValues = [];
-    for (const row of document.querySelectorAll("[data-app-action-sidebar-project-id]")) {
-      const value = row.getAttribute("data-app-action-sidebar-project-id");
-      const normalized = normalizePathForCompare(value);
-      if (normalized) {
-        addRoot(normalized);
-        projectIdValues.push(normalized);
-      }
-    }
-
-    const shortNames = projectIdValues.filter((id) => !/[/:]/.test(id));
-    if (shortNames.length > 0) {
-      const shortNameSet = new Set(shortNames);
-      for (const thread of readSnapshotThreads()) {
-        const cwd = normalizePathForCompare(thread.cwd);
-        if (!cwd) continue;
-        const base = cwd.split("/").filter(Boolean).pop() || "";
-        if (base && shortNameSet.has(base)) {
-          addRoot(cwd);
-        }
-      }
-    }
-
-    if (roots.size > 0) {
-      return rememberProjectRoots(roots);
-    }
-    if (state.lastProjectRoots.size > 0) {
-      return state.lastProjectRoots;
-    }
-    const snapshotRoots = collectSnapshotProjectRoots();
-    if (snapshotRoots.size > 0 && document.querySelector(PROJECT_LIST_SELECTOR)) {
-      return rememberProjectRoots(snapshotRoots);
-    }
-    return snapshotRoots;
-  }
-
-  function threadHasVisibleProject(thread, projectRoots) {
-    const cwd = normalizePathForCompare(thread?.cwd);
-    if (!cwd) return false;
-    for (const root of projectRoots) {
-      if (!root) continue;
-      if (cwd === root || cwd.startsWith(`${root}/`) || cwd.startsWith(`${root}\\`)) {
-        return true;
-      }
-    }
-    return false;
-  }
-
-  function collectNativeThreadIds() {
-    return new Set(
-      Array.from(document.querySelectorAll(THREAD_SELECTOR))
-        .filter((row) => !row.closest(SUPPLEMENT_SELECTOR) && !row.closest(MANAGED_ROW_SELECTOR))
-        .map((row) => row.getAttribute("data-app-action-sidebar-thread-id"))
-        .filter(Boolean)
-    );
-  }
-
-  function callAppAction(action, timeoutMs = 12000) {
-    return new Promise((resolve, reject) => {
-      const requestId = `clpb-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-      const timeout = window.setTimeout(() => {
-        window.removeEventListener("message", onMessage);
-        reject(new Error(`Codex app action timed out: ${action.type}`));
-      }, timeoutMs);
-
-      function onMessage(event) {
-        const data = event.data;
-        if (!data || data.type !== "debug-run-app-action-response" || data.requestId !== requestId) return;
-        window.clearTimeout(timeout);
-        window.removeEventListener("message", onMessage);
-        if (data.ok) {
-          resolve(data.result);
-        } else {
-          reject(new Error(data.errorMessage || `Codex app action failed: ${action.type}`));
-        }
-      }
-
-      window.addEventListener("message", onMessage);
-      const message = { type: "debug-run-app-action-request", requestId, action };
-      const bridge = window.electronBridge;
-      if (bridge?.sendMessageFromView) {
-        bridge.sendMessageFromView(message).catch((error) => {
-          window.clearTimeout(timeout);
-          window.removeEventListener("message", onMessage);
-          reject(error);
-        });
-      } else {
-        window.postMessage(message, "*");
-      }
-    });
-  }
-
-  async function callInternalAction(type, payload) {
-    const sendRequest = await loadInternalActionModule();
-    return sendRequest(type, payload);
-  }
-
-  function findInternalRequestHelper(mod) {
-    const preferred = ["oht", "ts", "It", "ln"];
-    for (const key of preferred) {
-      const value = mod?.[key];
-      if (typeof value !== "function") continue;
-      const source = Function.prototype.toString.call(value);
-      if (/sendRequest\s*\(/.test(source)) return { key, fn: value };
-    }
-
-    for (const key of Object.keys(mod || {})) {
-      const value = mod[key];
-      if (typeof value !== "function") continue;
-      let source = "";
-      try {
-        source = Function.prototype.toString.call(value);
-      } catch {
-        continue;
-      }
-      if (/sendRequest\s*\(/.test(source)) return { key, fn: value };
-    }
-    return null;
   }
 
   function normalizeSignalsModulePath(path) {
     if (!path) return "";
     if (/^https?:|^app:|^file:/i.test(path)) return path;
-    const relative = path.replace(/^\.\//, "");
+    const relative = String(path).replace(/^\.\//, "");
     if (relative.startsWith("assets/")) return `./${relative}`;
     if (/^(?:app-server-manager-signals|app-initial)-[A-Za-z0-9_-]+\.js$/.test(relative)) {
       return `./assets/${relative}`;
@@ -9149,85 +9163,90 @@ function switchControl(initial, onChange) {
     return "";
   }
 
-  function collectSignalsModuleCandidatesFromText(text) {
-    const candidates = [];
-    if (typeof text !== "string" || !text) return candidates;
+  function collectModuleNames(text, candidates) {
+    if (typeof text !== "string" || !text) return;
     for (const match of text.matchAll(SIGNALS_MODULE_RE)) {
       const candidate = normalizeSignalsModulePath(match[0]);
-      if (candidate) candidates.push(candidate);
+      if (candidate) candidates.add(candidate);
     }
-    return candidates;
   }
 
-  function collectSignalsModuleCandidatesFromRuntime() {
-    const candidates = new Set(SIGNALS_MODULE_FALLBACKS);
+  function collectInternalActionModuleCandidates() {
+    const candidates = new Set();
     const add = (value) => {
       const candidate = normalizeSignalsModulePath(value);
       if (candidate) candidates.add(candidate);
     };
 
-    collectSignalsModuleCandidatesFromText(document.documentElement?.outerHTML || "").forEach(add);
-
     for (const script of document.querySelectorAll("script[src]")) {
-      add(script.getAttribute("src") || "");
+      const src = script.getAttribute("src") || "";
+      add(src);
+      collectModuleNames(src, candidates);
     }
 
     try {
       for (const entry of performance.getEntriesByType("resource")) {
         const name = String(entry.name || "");
         if (/(?:app-server-manager-signals|app-initial)-/.test(name)) add(name);
+        collectModuleNames(name, candidates);
       }
     } catch {}
 
     return Array.from(candidates);
   }
 
-  async function discoverSignalsModuleCandidates() {
-    const candidates = new Set(collectSignalsModuleCandidatesFromRuntime());
-    const scriptsToScan = new Set(
-      Array.from(document.querySelectorAll("script[src]"))
-        .map((script) => script.getAttribute("src"))
-        .filter(Boolean)
-    );
+  async function discoverInternalActionModuleCandidates() {
+    const candidates = new Set(collectInternalActionModuleCandidates());
 
-    try {
-      for (const entry of performance.getEntriesByType("resource")) {
-        const name = String(entry.name || "");
-        if (/\.js(?:$|\?)/.test(name)) scriptsToScan.add(name);
-      }
-    } catch {}
-
-    for (const scriptUrl of scriptsToScan) {
+    // Codex loads a tiny hashed entry module whose source names the current
+    // app-initial module. Read only that local app:// entry; do not crawl or
+    // fetch conversation resources.
+    for (const script of document.querySelectorAll("script[src]")) {
+      const src = script.getAttribute("src") || "";
+      if (!src) continue;
       try {
-        const response = await fetch(scriptUrl);
-        if (!response.ok) continue;
-        collectSignalsModuleCandidatesFromText(await response.text()).forEach((candidate) => {
-          candidates.add(candidate);
-        });
+        const response = await fetch(src);
+        if (response.ok) collectModuleNames(await response.text(), candidates);
       } catch {}
     }
 
+    for (const fallback of SIGNALS_MODULE_FALLBACKS) candidates.add(fallback);
     return Array.from(candidates);
+  }
+
+  function findInternalRequestHelper(mod) {
+    const preferred = ["oht", "ts", "It", "ln"];
+    const keys = [...preferred, ...Object.keys(mod || {})];
+    const checked = new Set();
+
+    for (const key of keys) {
+      if (checked.has(key)) continue;
+      checked.add(key);
+      const value = mod?.[key];
+      if (typeof value !== "function") continue;
+      try {
+        if (/sendRequest\s*\(/.test(Function.prototype.toString.call(value))) {
+          return value;
+        }
+      } catch {}
+    }
+    return null;
   }
 
   async function loadInternalActionModule() {
     if (!state.internalActionModulePromise) {
       state.internalActionModulePromise = (async () => {
-        const candidates = await discoverSignalsModuleCandidates();
         let lastError = null;
-        for (const candidate of candidates) {
+        for (const candidate of await discoverInternalActionModuleCandidates()) {
           try {
             const mod = await import(candidate);
             const helper = findInternalRequestHelper(mod);
-            if (helper) {
-              log("internal action module", candidate, helper.key);
-              return helper.fn;
-            }
+            if (helper) return helper;
           } catch (error) {
             lastError = error;
           }
         }
-        throw lastError || new Error("Codex internal request helper module was not found");
+        throw lastError || new Error("未找到 Codex 原生历史刷新接口");
       })().catch((error) => {
         state.internalActionModulePromise = null;
         throw error;
@@ -9236,623 +9255,97 @@ function switchControl(initial, onChange) {
     return state.internalActionModulePromise;
   }
 
-  function sourceLooksInternal(source) {
-    if (source == null) return false;
-    if (typeof source === "string") {
-      return /(?:guardian|subagent|background|approval|review)/i.test(source);
-    }
-    if (typeof source !== "object") return false;
-    if (source.subagent != null) return true;
-    if (source.parentThreadId != null) return true;
-    if (source.sourceThreadId != null) return true;
-    try {
-      return /(?:guardian|subagent|background|approval|review)/i.test(JSON.stringify(source));
-    } catch {
-      return false;
-    }
+  async function callInternalAction(type, payload) {
+    const sendRequest = await loadInternalActionModule();
+    return sendRequest(type, payload);
   }
 
-  function shouldHideThread(thread) {
-    if (!thread || typeof thread !== "object") return false;
-    if (
-      thread.archived === true ||
-      thread.archived === 1 ||
-      thread.archived === "true" ||
-      thread.status === "archived" ||
-      thread.status?.type === "archived"
-    ) {
-      return true;
+  async function refresh(limit = readTarget()) {
+    const target = writeTarget(limit);
+    if (state.refreshInFlight && state.lastRequestedLimit === target) {
+      return state.refreshInFlight;
     }
-    const knownPath = String(thread.path || thread.rolloutPath || thread.savedPath || "").replaceAll("\\", "/");
-    if (/\/archived_sessions\//i.test(knownPath)) return true;
-    if (sourceLooksInternal(thread.source)) return true;
-    if (sourceLooksInternal(thread.threadSource)) return true;
-    if (sourceLooksInternal(thread.originator)) return true;
-    if (typeof thread.agentRole === "string" && /(?:guardian|subagent|background|approval|review)/i.test(thread.agentRole)) return true;
-    if (typeof thread.agentNickname === "string" && /(?:guardian|subagent|background|approval|review)/i.test(thread.agentNickname)) return true;
-    return false;
-  }
 
-  function normalizeListedThread(thread) {
-    if (!thread || typeof thread.id !== "string") return null;
-    if (shouldHideThread(thread)) return null;
-    const cwd = normalizeCwd(thread.cwd);
-    const title = String(thread.name || thread.title || thread.preview || "").trim();
-    if (!cwd && !title) return null;
-    return {
-      id: threadRawId(thread.id),
-      title: title || thread.id,
-      cwd
-    };
-  }
+    state.lastRequestedLimit = target;
+    state.refreshAttempts += 1;
+    state.lastRefreshError = "";
 
-  function mergeSnapshotThreads(nextThreads, limit = readTarget()) {
-    const archivedIds = readArchivedIds();
-    const hiddenIds = readHiddenIds();
-    const byId = new Map();
-    for (const thread of nextThreads) {
-      const normalized = normalizeListedThread(thread);
-      if (!normalized) continue;
-      const rawId = threadRawId(normalized);
-      if (archivedIds.has(rawId) || hiddenIds.has(rawId)) continue;
-      byId.set(normalized.id, normalized);
-    }
-    const merged = Array.from(byId.values())
-      .filter((thread) => threadRawId(thread))
-      .slice(0, normalizeTarget(limit));
-    writeSnapshotThreads(merged);
-    return merged.length;
-  }
-
-  async function sendCliRequest(method, params, options = {}) {
-    return callInternalAction("send-cli-request-for-host", {
+    const request = callInternalAction("refresh-recent-conversations-for-host", {
       hostId: "local",
-      method,
-      params,
-      timeoutMs: options.timeoutMs
-    });
-  }
-
-  function threadListParams({ archived, cursor, global }) {
-    const params = {
-      archived,
-      cursor,
-      limit: CLI_PAGE_SIZE,
-      sortKey: "updated_at"
-    };
-    if (global) {
-      return {
-        ...params,
-        modelProviders: [],
-        sourceKinds: ["cli", "vscode", "appServer", "unknown"],
-        useStateDbOnly: true,
-        includeAllWorkspaces: true,
-        includeAllProjects: true
-      };
-    }
-    return { ...params, modelProviders: null };
-  }
-
-  async function listThreadsFromCliVariant({ archived, limit, global }) {
-    const threads = [];
-    let cursor = null;
-    for (let page = 0; page < CLI_MAX_PAGES && threads.length < limit; page += 1) {
-      const result = await sendCliRequest(
-        "thread/list",
-        threadListParams({ archived, cursor, global }),
-        { timeoutMs: 12000 }
-      );
-      const data = Array.isArray(result?.data) ? result.data : [];
-      threads.push(...data);
-      cursor = result?.nextCursor || null;
-      if (!cursor || data.length === 0) break;
-    }
-    return threads;
-  }
-
-  async function listThreadsFromCli({ archived, limit = readTarget() }) {
-    if (!GLOBAL_EXTRA_HISTORY) {
-      return listThreadsFromCliVariant({ archived, limit, global: false });
-    }
-    try {
-      return await listThreadsFromCliVariant({ archived, limit, global: true });
-    } catch (error) {
-      log("global thread/list failed; retrying default scope", String(error));
-      return listThreadsFromCliVariant({ archived, limit, global: false });
-    }
-  }
-
-  async function findNativeConversationManager() {
-    if (state.nativeManager) return state.nativeManager;
-    if (state.nativeManagerPromise) return state.nativeManagerPromise;
-
-    state.nativeManagerPromise = (async () => {
-      const root = document.getElementById("root");
-      const containerKey = root && Object.getOwnPropertyNames(root)
-        .find((key) => key.startsWith("__reactContainer$"));
-      if (!root || !containerKey) return null;
-
-      const queue = [root[containerKey]];
-      const seen = new WeakSet();
-      let index = 0;
-      let visited = 0;
-
-      while (index < queue.length && visited < NATIVE_MANAGER_SCAN_LIMIT) {
-        const value = queue[index++];
-        if (!value || (typeof value !== "object" && typeof value !== "function") || seen.has(value)) continue;
-        seen.add(value);
-        visited += 1;
-
-        try {
-          if (
-            value.threadStore
-            && typeof value.refreshRecentConversations === "function"
-            && typeof value.getThreadSummaries === "function"
-            && typeof value.getConversation === "function"
-          ) {
-            state.nativeManager = value;
-            log("native conversation manager found", { visited, hostId: value.getHostId?.() || "local" });
-            return value;
-          }
-        } catch {}
-
-        let children = [];
-        try {
-          if (value instanceof Map) {
-            children = [...value.keys(), ...value.values()];
-          } else if (value instanceof Set) {
-            children = [...value.values()];
-          } else {
-            const keys = Object.getOwnPropertyNames(value);
-            if (keys.length <= 300) {
-              for (const key of keys) {
-                if (["ownerDocument", "parentNode", "parentElement", "previousSibling", "nextSibling", "defaultView", "window", "document"].includes(key)) continue;
-                let child;
-                try {
-                  child = value[key];
-                } catch {
-                  continue;
-                }
-                if (child && (typeof child === "object" || typeof child === "function")) children.push(child);
-              }
-            }
-          }
-        } catch {}
-
-        for (const child of children) {
-          if (!seen.has(child)) queue.push(child);
-        }
-        if (visited % 3000 === 0) {
-          await new Promise((resolve) => window.setTimeout(resolve, 0));
-        }
-      }
-
-      log("native conversation manager not found", { visited });
-      return null;
-    })();
-
-    const manager = await state.nativeManagerPromise;
-    if (!manager) state.nativeManagerPromise = null;
-    return manager;
-  }
-
-  function configureNativeHistoryLimit(manager, limit) {
-    const runtimeSettings = manager?.runtimeSettings;
-    if (!runtimeSettings || typeof runtimeSettings.getRecentConversationDiscoveryLimit !== "function") return;
-    state.nativeHistoryLimit = normalizeTarget(limit);
-    if (!state.nativeRuntimeSettings) {
-      state.nativeRuntimeSettings = runtimeSettings;
-      state.nativeOriginalHistoryLimit = runtimeSettings.getRecentConversationDiscoveryLimit;
-      state.nativeHistoryLimitGetter = () => state.nativeHistoryLimit;
-    }
-    runtimeSettings.getRecentConversationDiscoveryLimit = state.nativeHistoryLimitGetter;
-  }
-
-  async function loadThroughNativeManager(manager, conversationIds, limit) {
-    configureNativeHistoryLimit(manager, limit);
-    try {
-      await manager.refreshRecentConversations({ mode: "expanded", sortKey: "updated_at" });
-    } catch (error) {
-      log("native expanded refresh failed; continuing with hydration", String(error));
-    }
-
-    const target = normalizeTarget(limit);
-    const summaryIds = (manager.getThreadSummaries?.() || [])
-      .map((thread) => String(thread?.conversationId || ""))
-      .filter(Boolean);
-    const desiredIds = [...new Set([...summaryIds, ...conversationIds])].slice(0, target);
-    state.nativeSummaryThreads = summaryIds.length;
-    state.nativeIdsRequested = desiredIds.length;
-
-    const missingBefore = desiredIds.filter((id) => manager.getConversation(id) == null);
-    const failedIds = new Set();
-    for (let index = 0; index < missingBefore.length; index += NATIVE_HYDRATE_BATCH_SIZE) {
-      const batch = missingBefore.slice(index, index + NATIVE_HYDRATE_BATCH_SIZE);
-      try {
-        await manager.hydrateBackgroundThreads(batch);
-      } catch {
-        for (const id of batch) {
-          try {
-            await manager.hydrateBackgroundThreads([id]);
-          } catch {
-            failedIds.add(id);
-          }
-        }
-      }
-    }
-
-    const availableIds = desiredIds.filter((id) => manager.getConversation(id) != null);
-    const threadStore = manager.threadStore;
-    threadStore.recentConversationIds = availableIds;
-    threadStore.notifyAnyConversationCallbacks?.({ forceAny: true, forceMeta: true });
-
-    state.nativeCachedThreads = availableIds.length;
-    state.nativeMissingThreads = desiredIds.length - availableIds.length;
-    if (state.nativeMissingThreads > 0) {
-      state.lastNativeLoadError = `${state.nativeMissingThreads} conversation(s) could not be hydrated`;
-      log("native hydration incomplete", {
-        desired: desiredIds.length,
-        available: availableIds.length,
-        failed: failedIds.size
-      });
-    }
-    return availableIds.length;
-  }
-
-  async function loadNativeRecentHistory(threads, limit) {
-    const conversationIds = threads
-      .map(threadRawId)
-      .filter(Boolean)
-      .slice(0, normalizeTarget(limit));
-    state.nativeIdsRequested = conversationIds.length;
-    state.lastNativeLoadError = "";
-    if (conversationIds.length === 0) return 0;
-
-    try {
-      const manager = await findNativeConversationManager();
-      if (manager) return await loadThroughNativeManager(manager, conversationIds, limit);
-
-      const loadedIds = await callInternalAction("load-recent-conversation-ids-for-host", {
-        hostId: "local",
-        conversationIds
-      });
-      state.nativeCachedThreads = Array.isArray(loadedIds) ? loadedIds.length : conversationIds.length;
-      state.nativeMissingThreads = Math.max(0, conversationIds.length - state.nativeCachedThreads);
-      return state.nativeCachedThreads;
-    } catch (error) {
-      state.lastNativeLoadError = String(error);
-      log("native recent id load failed", state.lastNativeLoadError);
+      mode: "expanded",
+      sortKey: "updated_at",
+      limit: target,
+      pageSize: target,
+      page_size: target
+    }).then(() => {
+      state.lastRefreshAt = Date.now();
+      log(`requested up to ${target} native conversations`);
+      return target;
+    }).catch((error) => {
+      state.lastRefreshError = error?.message || String(error);
       throw error;
-    }
-  }
-
-  async function refreshSnapshotFromCli(force = false, requestedLimit = readTarget()) {
-    const now = Date.now();
-    if (state.snapshotRefreshInFlight) return;
-    if (!force && now - state.lastSnapshotRefreshAt < 30000) return;
-    state.snapshotRefreshInFlight = true;
-    state.lastSnapshotRefreshAt = now;
-    state.lastSnapshotError = "";
-    const limit = normalizeTarget(requestedLimit);
-    try {
-      const [threads, archivedThreads] = await Promise.all([
-        listThreadsFromCli({ archived: false, limit }),
-        listThreadsFromCli({ archived: true, limit })
-      ]);
-      const archivedIds = rememberArchivedIds(archivedThreads.map(threadRawId));
-      const hiddenIds = rememberHiddenIds(threads.filter(shouldHideThread).map(threadRawId));
-      const idsToRemove = new Set([...archivedIds, ...hiddenIds]);
-      const removedArchived = pruneSnapshotThreads(idsToRemove);
-      const count = mergeSnapshotThreads(threads, limit);
-      const nativeRequested = await loadNativeRecentHistory(threads, limit);
-      log("snapshot refreshed", {
-        limit,
-        fetched: threads.length,
-        archived: archivedThreads.length,
-        hidden: hiddenIds.size,
-        removedArchived,
-        snapshot: count,
-        nativeRequested
-      });
-      renderSupplementalHistory();
-      return count;
-    } catch (error) {
-      state.lastSnapshotError = String(error);
-      log("snapshot refresh failed", state.lastSnapshotError);
-      if (force) throw error;
-      return null;
-    } finally {
-      state.snapshotRefreshInFlight = false;
-    }
-  }
-
-  async function loadThreadIntoNativeCache(rawId) {
-    await callInternalAction("load-recent-conversation-ids-for-host", {
-      hostId: "local",
-      conversationIds: [rawId]
+    }).finally(() => {
+      if (state.refreshInFlight === request) state.refreshInFlight = null;
     });
-    const result = await sendCliRequest(
-      "thread/read",
-      {
-        threadId: rawId,
-        includeTurns: false
-      },
-      { timeoutMs: 12000 }
-    ).catch(() => null);
-    const rawThread = result?.thread || result;
-    if (rawThread?.archived === true || rawThread?.status?.type === "archived") {
-      rememberArchivedIds([rawId]);
-      pruneSnapshotThreads([rawId]);
-      return false;
-    }
-    if (shouldHideThread(rawThread)) {
-      rememberHiddenIds([rawId]);
-      pruneSnapshotThreads([rawId]);
-      return false;
-    }
-    const thread = normalizeListedThread(rawThread);
-    if (thread) mergeSnapshotThreads([...readSnapshotThreads(), thread]);
-    return true;
-  }
 
-  function findNativeThreadRow(localId) {
-    return Array.from(document.querySelectorAll(`[data-app-action-sidebar-thread-id="${CSS.escape(localId)}"]`))
-      .find((row) => row instanceof HTMLElement && !row.hasAttribute("data-clpb-managed-row") && !row.closest(SUPPLEMENT_SELECTOR));
-  }
-
-  function getReactPropsKey(element) {
-    return Object.keys(element).find((key) => key.startsWith("__reactProps"));
-  }
-
-  function clickNativeThreadRow(localId) {
-    const row = findNativeThreadRow(localId);
-    if (!row) return false;
-
-    const reactPropsKey = getReactPropsKey(row);
-    const onClick = reactPropsKey ? row[reactPropsKey]?.onClick : null;
-    if (typeof onClick === "function") {
-      const event = {
-        currentTarget: row,
-        target: row,
-        defaultPrevented: false,
-        preventDefault() {
-          this.defaultPrevented = true;
-        },
-        stopPropagation() {
-          this.propagationStopped = true;
-        }
-      };
-      onClick(event);
-      return true;
-    }
-
-    row.click();
-    return true;
-  }
-
-  async function waitForNativeThreadRow(localId, timeoutMs = 5000) {
-    const startedAt = Date.now();
-    while (Date.now() - startedAt < timeoutMs) {
-      if (findNativeThreadRow(localId)) return true;
-      await new Promise((resolve) => setTimeout(resolve, 150));
-    }
-    return false;
-  }
-
-  async function openThread(thread) {
-    const rawId = threadRawId(thread);
-    const localId = `local:${rawId}`;
-    const cwd = normalizeCwd(thread.cwd) || "/";
-
-    try {
-      const found = await loadThreadIntoNativeCache(rawId);
-      log("native cache load", rawId, found);
-    } catch (error) {
-      log("native cache load failed", rawId, String(error));
-    }
-
-    try {
-      const cwd = normalizeCwd(thread.cwd) || "/";
-      await callInternalAction("maybe-resume-conversation", {
-        hostId: "local",
-        conversationId: rawId,
-        model: null,
-        serviceTier: null,
-        reasoningEffort: null,
-        workspaceRoots: [cwd],
-        permissions: null,
-        collaborationMode: null,
-        showThreadGoalResumeConfirmation: true,
-        showPausedGoalResumeConfirmation: true
-      });
-      log("thread resumed", rawId);
-    } catch (error) {
-      log("thread resume failed", rawId, String(error));
-    }
-
-    try {
-      await loadThreadIntoNativeCache(rawId);
-    } catch (error) {
-      log("native cache reload failed", rawId, String(error));
-    }
-
-    scheduleExpand("open-thread");
-
-    if (await waitForNativeThreadRow(localId)) {
-      if (clickNativeThreadRow(localId)) {
-        log("native row clicked", rawId);
-        return;
-      }
-    }
-
-    try {
-      await callAppAction({
-        type: "windows.show_thread",
-        windowId: "current",
-        threadId: rawId
-      });
-      return;
-    } catch (error) {
-      log("show thread raw failed", rawId, String(error));
-    }
-
-    try {
-      await callAppAction({
-        type: "windows.show_thread",
-        windowId: "current",
-        threadId: localId
-      });
-    } catch (error) {
-      log("show thread local failed", localId, String(error));
-    }
-  }
-
-  function countExpandButtons() {
-    return Array.from(document.querySelectorAll(`${PROJECT_LIST_SELECTOR} button`)).filter(isExpandButton).length;
-  }
-
-  function renderSupplementalHistory() {
-    document.querySelectorAll(SUPPLEMENT_SELECTOR).forEach((section) => section.remove());
-    document.querySelectorAll(PROJECT_SUPPLEMENT_ITEM_SELECTOR).forEach((item) => item.remove());
-  }
-
-  function expandNativeProjectLists(reason = "scan") {
-    let clicked = 0;
-    const lists = Array.from(document.querySelectorAll(PROJECT_LIST_SELECTOR));
-    state.programmaticExpand = true;
-    try {
-      for (const list of lists) {
-        const buttons = Array.from(list.querySelectorAll("button")).filter(isExpandButton);
-        for (const button of buttons) {
-          state.clicked.add(button);
-          button.click();
-          clicked += 1;
-        }
-      }
-    } finally {
-      state.programmaticExpand = false;
-    }
-    if (clicked || reason === "manual") {
-      log("native expand", {
-        reason,
-        clicked,
-        projects: lists.length,
-        threads: document.querySelectorAll(THREAD_SELECTOR).length,
-        remainingExpandButtons: countExpandButtons()
-      });
-    }
-    renderSupplementalHistory();
-    return clicked;
-  }
-
-  function autoExpandNativeProjectLists(reason) {
-    const withinAutoWindow = Date.now() <= state.autoExpandDeadlineMs;
-    if (!state.autoExpandEnabled || !withinAutoWindow) {
-      renderSupplementalHistory();
-      return 0;
-    }
-    return expandNativeProjectLists(reason);
-  }
-
-  function scheduleExpand() {
-    renderSupplementalHistory();
-  }
-
-  function scheduleStartupHistoryRefresh(attempt = 0) {
-    if (state.startupRefreshCompleted || attempt >= STARTUP_REFRESH_DELAYS_MS.length) return;
-    if (state.startupRefreshTimer) window.clearTimeout(state.startupRefreshTimer);
-    state.startupRefreshTimer = window.setTimeout(async () => {
-      state.startupRefreshTimer = 0;
-      state.startupRefreshAttempts = attempt + 1;
-      state.lastStartupRefreshError = "";
-      try {
-        const count = await refreshSnapshotFromCli(true, readTarget());
-        state.startupRefreshCount = Number.isFinite(count) ? count : readSnapshotThreads().length;
-        state.startupRefreshCompleted = true;
-        log("startup history refresh completed", {
-          attempt: state.startupRefreshAttempts,
-          count: state.startupRefreshCount,
-          nativeCachedThreads: state.nativeCachedThreads
-        });
-      } catch (error) {
-        state.lastStartupRefreshError = String(error);
-        log("startup history refresh failed", {
-          attempt: state.startupRefreshAttempts,
-          error: state.lastStartupRefreshError
-        });
-        scheduleStartupHistoryRefresh(attempt + 1);
-      }
-    }, STARTUP_REFRESH_DELAYS_MS[attempt]);
+    state.refreshInFlight = request;
+    return request;
   }
 
   function stop() {
-    renderSupplementalHistory();
-    if (state.startupRefreshTimer) {
-      window.clearTimeout(state.startupRefreshTimer);
-      state.startupRefreshTimer = 0;
-    }
-    if (
-      state.nativeRuntimeSettings
-      && state.nativeHistoryLimitGetter
-      && state.nativeRuntimeSettings.getRecentConversationDiscoveryLimit === state.nativeHistoryLimitGetter
-    ) {
-      state.nativeRuntimeSettings.getRecentConversationDiscoveryLimit = state.nativeOriginalHistoryLimit;
-    }
-    log("stopped");
+    state.stopped = true;
+    for (const timer of state.startupTimers) window.clearTimeout(timer);
+    state.startupTimers.clear();
+  }
+
+  function scheduleScriptLoadHistoryRefresh() {
+    SCRIPT_LOAD_REFRESH_DELAYS_MS.forEach((delay) => {
+      const timer = window.setTimeout(async () => {
+        state.startupTimers.delete(timer);
+        if (state.stopped || state.startupCompleted) return;
+        state.startupAttempts += 1;
+        try {
+          await refresh(readTarget());
+          state.startupCompleted = true;
+          for (const pending of state.startupTimers) window.clearTimeout(pending);
+          state.startupTimers.clear();
+        } catch (error) {
+          log("startup refresh failed", error?.message || String(error));
+        }
+      }, delay);
+      state.startupTimers.add(timer);
+    });
   }
 
   window[SCRIPT_KEY] = {
     embeddedBy: "bennett-ui-improvements",
-    expand: () => expandNativeProjectLists("manual"),
-    open: openThread,
-    refresh: (limit = readTarget()) => refreshSnapshotFromCli(true, writeTarget(limit)),
+    refresh,
     getLimit: readTarget,
     setLimit: writeTarget,
-    resetHistory: () => {
-      localStorage.removeItem(STORAGE_KEY);
-      localStorage.removeItem(HIDDEN_IDS_KEY);
-      localStorage.setItem(STORAGE_VERSION_KEY, STORAGE_VERSION);
-      void refreshSnapshotFromCli(true).catch((error) => log("history reset refresh failed", String(error)));
-      scheduleExpand("reset-history");
-    },
-    render: renderSupplementalHistory,
+    stop,
     status: () => ({
-      projects: document.querySelectorAll(PROJECT_LIST_SELECTOR).length,
-      threads: document.querySelectorAll(THREAD_SELECTOR).length,
-      nativeThreads: collectNativeThreadIds().size,
-      supplementThreads: document.querySelectorAll("[data-clpb-supplemental-row]").length,
-      projectSupplementItems: document.querySelectorAll(PROJECT_SUPPLEMENT_ITEM_SELECTOR).length,
-      snapshotThreads: readSnapshotThreads().length,
-      snapshotProjects: snapshotProjectCounts(20),
-      lastSnapshotRefreshAt: state.lastSnapshotRefreshAt,
-      snapshotRefreshInFlight: state.snapshotRefreshInFlight,
-      lastSnapshotError: state.lastSnapshotError,
-      nativeIdsRequested: state.nativeIdsRequested,
-      nativeCachedThreads: state.nativeCachedThreads,
-      nativeSummaryThreads: state.nativeSummaryThreads,
-      nativeMissingThreads: state.nativeMissingThreads,
-      nativeManagerFound: Boolean(state.nativeManager),
-      lastNativeLoadError: state.lastNativeLoadError,
-      startupRefreshAttempts: state.startupRefreshAttempts,
-      startupRefreshCompleted: state.startupRefreshCompleted,
-      startupRefreshCount: state.startupRefreshCount,
-      lastStartupRefreshError: state.lastStartupRefreshError,
       configuredLimit: readTarget(),
-      globalExtraHistory: GLOBAL_EXTRA_HISTORY,
+      lastRequestedLimit: state.lastRequestedLimit,
+      refreshAttempts: state.refreshAttempts,
+      lastRefreshAt: state.lastRefreshAt,
+      lastRefreshError: state.lastRefreshError,
+      startupAttempts: state.startupAttempts,
+      startupCompleted: state.startupCompleted,
       renderer: "codex-native",
-      observerScope: "none",
-      requestInterceptionEnabled: false,
-      expandButtons: countExpandButtons(),
+      operation: "refresh-recent-conversations-for-host",
+      sessionQueries: false,
+      sessionReads: false,
+      sessionWrites: false,
+      providerMutation: false,
+      summaryHydration: false,
+      sidebarMutation: false,
+      projectExpansion: false,
       href: location.href
-    }),
-    stop
+    })
   };
 
   window.__bennettUiEmbeddedHistoryLoader = window[SCRIPT_KEY];
-
-  renderSupplementalHistory();
-  migrateStorageForGlobalHistory();
-  scheduleStartupHistoryRefresh();
-  log("loaded", window[SCRIPT_KEY].status());
+  scheduleScriptLoadHistoryRefresh();
 })();
+
 /* END BENNETT EMBEDDED NATIVE HISTORY LOADER */

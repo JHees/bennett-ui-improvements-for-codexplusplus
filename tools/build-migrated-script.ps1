@@ -10,6 +10,7 @@ $outPath = Join-Path (Get-Location) $Out
 $outDir = Split-Path -Parent $outPath
 New-Item -ItemType Directory -Force -Path $outDir | Out-Null
 $previewMathFeaturePath = Resolve-Path -LiteralPath "features\markdown-preview-math.js"
+$nativeHistoryFeaturePath = Resolve-Path -LiteralPath "features\native-history-loader.js"
 
 $sourceText = Get-Content -LiteralPath $sourcePath -Raw -Encoding utf8
 $sourceText = $sourceText -replace "\r\n", "`n"
@@ -20,8 +21,9 @@ $sourceText = $sourceText.Replace(
 )
 $previewMathFeature = Get-Content -LiteralPath $previewMathFeaturePath -Raw -Encoding utf8
 $previewMathFeature = $previewMathFeature -replace "\r\n", "`n"
+$nativeHistoryFeature = Get-Content -LiteralPath $nativeHistoryFeaturePath -Raw -Encoding utf8
+$nativeHistoryFeature = $nativeHistoryFeature -replace "\r\n", "`n"
 $sourceText = $sourceText.Replace("const FEATURES = {", "const FEATURES = {`n$previewMathFeature")
-$sourceText = $sourceText.Replace('let snapshot = readSnapshot(api);', 'let snapshot = null; // Do not render persisted quota data before this page fetches fresh usage.')
 $sourceText = [regex]::Replace($sourceText, '    const ASIDE_SELECTOR = \[[\s\S]*?    \]\.join\(", "\);\n', @'
     const ASIDE_SELECTOR = [
       "aside.pointer-events-auto.relative.flex.overflow-hidden",
@@ -39,13 +41,20 @@ $sourceText = [regex]::Replace($sourceText, '    const ASIDE_SELECTOR = \[[\s\S]
     ].join(", ");
 
 '@, 1)
-$sourceText = $sourceText.Replace('let bridgeRequestSeq = 0;', @'
-let bridgeRequestSeq = 0;
+$sourceText = $sourceText.Replace(@'
+    let bridgeRequestSeq = 0;
+    let disposed = false;
+'@, @'
+    let bridgeRequestSeq = 0;
+    let disposed = false;
     let lastMountedMode = null;
     let accountMode = "unknown"; // "official" | "api" | "unknown"
     let accountModeInFlight = false;
     let accountModeLastCheckedAt = 0;
     let accountModeLogged = false;
+    let accountModeCandidate = "unknown";
+    let accountModeCandidateCount = 0;
+    let accountModeCandidateAt = 0;
 '@)
 $sourceText = $sourceText.Replace(@'
       if (!partial?.fiveHour && !partial?.weekly) return false;
@@ -58,11 +67,18 @@ $sourceText = $sourceText.Replace(@'
 '@, @'
     const bridgePostJson = async (path, payload = {}, timeoutMs = 2_500) => {
       const bridge = window.__codexSessionDeleteBridge;
-      if (typeof bridge !== "function") return null;
-      return await Promise.race([
-        bridge(path, payload),
-        new Promise((resolve) => window.setTimeout(() => resolve(null), timeoutMs)),
-      ]);
+      if (disposed || typeof bridge !== "function") return null;
+      let timeout = 0;
+      try {
+        return await Promise.race([
+          bridge(path, payload),
+          new Promise((resolve) => {
+            timeout = window.setTimeout(() => resolve(null), timeoutMs);
+          }),
+        ]);
+      } finally {
+        if (timeout) window.clearTimeout(timeout);
+      }
     };
 
     const activeRelayProfile = (settings) => {
@@ -100,8 +116,9 @@ $sourceText = $sourceText.Replace(@'
       accountModeInFlight = true;
       try {
         let nextMode = "unknown";
-        let settingsMode = "unknown";
+        let explicitMode = false;
         const settings = await bridgePostJson("/settings/get", {});
+        if (disposed) return accountMode;
         const profile = activeRelayProfile(settings);
         const relayMode = fieldValue(profile, "relayMode", "relay_mode");
         const officialMixApiKey = !!fieldValue(profile, "officialMixApiKey", "official_mix_api_key");
@@ -111,38 +128,70 @@ $sourceText = $sourceText.Replace(@'
         );
         if (relayMode === "official" && !officialMixApiKey) {
           nextMode = "official";
+          explicitMode = true;
         } else if (relayMode === "pureApi" || relayMode === "pure_api") {
           nextMode = "api";
+          explicitMode = true;
         } else if (relayMode === "mixedApi" || relayMode === "mixed_api" || officialMixApiKey) {
           nextMode = "api";
+          explicitMode = true;
         } else if (!relayMode && legacyApiConfigured) {
           nextMode = "api";
+          explicitMode = true;
         }
 
         if (nextMode === "unknown") {
           const catalog = await bridgePostJson("/codex-model-catalog", {});
+          if (disposed) return accountMode;
           if (catalogLooksLikeApiMode(catalog)) nextMode = "api";
           else if (catalog?.model_provider === "openai" || catalog?.provider_name === "openai") {
             nextMode = "official";
           }
         }
-        if (nextMode === "unknown") nextMode = settingsMode;
+        if (nextMode === "unknown") return accountMode;
 
-        if (nextMode !== "unknown" && nextMode !== accountMode) {
-          accountMode = nextMode;
-          if (accountMode === "api") {
-            snapshot = {
-              fiveHour: { label: "API", pct: null, resetAt: null, apiMode: true },
-              weekly: null,
-              at: Date.now(),
-              apiMode: true,
-            };
-          } else if (snapshot?.apiMode) {
-            snapshot = null;
-          }
-          ensureMounted(true);
+        // Catalog responses can briefly reflect the previous provider while
+        // Codex is switching accounts. Require two matching non-explicit
+        // observations before changing the visible mode.
+        if (nextMode === accountMode) {
+          accountModeCandidate = "unknown";
+          accountModeCandidateCount = 0;
+          accountModeCandidateAt = 0;
+          return accountMode;
         }
-        if (!accountModeLogged && accountMode !== "unknown") {
+        if (accountMode !== "unknown" || !explicitMode) {
+          if (
+            accountModeCandidate === nextMode &&
+            now - accountModeCandidateAt < 45_000
+          ) {
+            accountModeCandidateCount += 1;
+          } else {
+            accountModeCandidate = nextMode;
+            accountModeCandidateCount = 1;
+            accountModeCandidateAt = now;
+          }
+          if (accountModeCandidateCount < 2) return accountMode;
+        }
+
+        accountModeCandidate = "unknown";
+        accountModeCandidateCount = 0;
+        accountModeCandidateAt = 0;
+        accountMode = nextMode;
+        if (accountMode === "api") {
+          snapshot = {
+            fiveHour: { label: "API", pct: null, resetAt: null, apiMode: true },
+            weekly: null,
+            at: Date.now(),
+            apiMode: true,
+          };
+        } else {
+          // Keep the last stable value visible while the official snapshot
+          // refreshes. Clearing here caused the control to flash "—".
+          directUsageAvailable = false;
+          directUsageLastAttemptAt = 0;
+        }
+        ensureMounted(true);
+        if (!accountModeLogged) {
           accountModeLogged = true;
           log("account mode", accountMode);
         }
@@ -289,6 +338,14 @@ $sourceText = $sourceText.Replace(@'
     };
 
     const findUsageSidebar = () => {
+      const primarySidebar = Array.from(document.querySelectorAll(ASIDE_SELECTOR))
+        .find((sidebar) => {
+          if (!(sidebar instanceof HTMLElement) || !isVisibleElement(sidebar)) return false;
+          if (looksLikeSettingsSidebar(sidebar)) return false;
+          const rect = sidebar.getBoundingClientRect();
+          return rect.width >= 150 && rect.height >= 300;
+        });
+      if (primarySidebar instanceof HTMLElement) return primarySidebar;
       const candidates = new Set(
         Array.from(document.querySelectorAll(SIDEBAR_CANDIDATE_SELECTOR))
           .filter((node) => node instanceof HTMLElement),
@@ -302,6 +359,7 @@ $sourceText = $sourceText.Replace(@'
 '@)
 $sourceText = $sourceText.Replace(@'
     const ensureMounted = (forceRebuild = false) => {
+      if (disposed) return;
       if (!snapshot || (!snapshot.fiveHour && !snapshot.weekly)) return;
       const slot = findSidebarSlot();
 '@, @'
@@ -368,24 +426,6 @@ $sourceText = $sourceText.Replace(@'
     const isUsageControlNode = (node) =>
       node.closest?.('[data-codexpp="usage-slot"], [data-codexpp="usage-box"], [data-codexpp="usage-boxes"]');
 
-    const rowControls = (row) =>
-      Array.from(row.querySelectorAll('button, a, [role="button"]'))
-        .filter((control) =>
-          control instanceof HTMLElement &&
-          isVisibleElement(control) &&
-          !isUsageControlNode(control),
-        );
-
-    const isSlotAfterRightmostControl = (slot) => {
-      const row = slot.parentElement;
-      if (!(row instanceof HTMLElement)) return false;
-      const controls = rowControls(row);
-      if (!controls.length) return true;
-      const slotRect = slot.getBoundingClientRect();
-      const rightmostControl = Math.max(...controls.map((control) => control.getBoundingClientRect().right));
-      return slotRect.right >= rightmostControl - 2;
-    };
-
     const nearestControlRow = (sidebar, button) => {
       const sidebarRect = sidebar.getBoundingClientRect();
       let row = button.parentElement;
@@ -402,7 +442,7 @@ $sourceText = $sourceText.Replace(@'
           insideSidebar &&
           nearBottom &&
           rect.height > 0 &&
-          rect.height <= 88 &&
+          rect.height <= 128 &&
           (style.display === "flex" || style.display === "grid" || buttonCount >= 2);
         if (looksLikeControlLayer) return row;
         row = row.parentElement;
@@ -447,16 +487,29 @@ $sourceText = $sourceText.Replace(@'
       return slot;
     };
 
+    const createFallbackSlot = (sidebar) => {
+      const existing = sidebar.querySelector(':scope > [data-codexpp="usage-slot"]');
+      if (existing instanceof HTMLElement) return existing;
+      const slot = document.createElement("div");
+      slot.dataset.codexpp = "usage-slot";
+      slot.dataset.codexppUsageSlot = "sidebar-floating-fallback";
+      slot.className = "flex items-center";
+      slot.style.position = "absolute";
+      slot.style.right = "0.75rem";
+      slot.style.bottom = "0.75rem";
+      slot.style.zIndex = "30";
+      sidebar.appendChild(slot);
+      return slot;
+    };
+
     const findSidebarSlot = () => {
       const sidebar = findUsageSidebar();
       if (!sidebar) return null;
       for (const slot of sidebar.querySelectorAll('[data-codexpp="usage-slot"]')) {
-        const row = slot.parentElement;
         if (
           !(slot instanceof HTMLElement) ||
-          !(row instanceof HTMLElement) ||
-          !isNearSidebarBottom(sidebar, row) ||
-          !isSlotAfterRightmostControl(slot)
+          !(slot.parentElement instanceof HTMLElement) ||
+          !slot.isConnected
         ) {
           slot.remove();
         }
@@ -465,8 +518,7 @@ $sourceText = $sourceText.Replace(@'
         .find((slot) =>
           slot instanceof HTMLElement &&
           slot.parentElement instanceof HTMLElement &&
-          isNearSidebarBottom(sidebar, slot.parentElement) &&
-          isSlotAfterRightmostControl(slot),
+          slot.isConnected,
         );
       if (existingSlot instanceof HTMLElement) return existingSlot;
 
@@ -475,7 +527,6 @@ $sourceText = $sourceText.Replace(@'
           button instanceof HTMLElement &&
           isVisibleElement(button) &&
           isNearSidebarBottom(sidebar, button) &&
-          !button.closest("section") &&
           !isUsageControlNode(button),
         );
       const deviceControls = controls.filter(isDeviceButton);
@@ -518,7 +569,7 @@ $sourceText = $sourceText.Replace(@'
         if (row) return createInlineSlot(row, anchor);
       }
 
-      return null;
+      return createFallbackSlot(sidebar);
     };
 
     const displaySnapshot = () =>
@@ -541,43 +592,41 @@ $sourceText = $sourceText.Replace(@'
           };
 
     const ensureMounted = (forceRebuild = false) => {
+      if (disposed) return;
       const visibleSnapshot = displaySnapshot();
       const slot = findSidebarSlot();
-      document.querySelectorAll('[data-codexpp="usage-floating-slot"]').forEach((node) => node.remove());
 '@)
 $sourceText = $sourceText.Replace('mounted._refresh?.(snapshot);', 'mounted._refresh?.(visibleSnapshot);')
 $sourceText = $sourceText.Replace('mounted = renderUsageBox(api, snapshot);', 'mounted = renderUsageBox(api, visibleSnapshot);')
 $sourceText = $sourceText.Replace(@'
     const refreshUsageFromApi = async () => {
+      if (disposed) return false;
 '@, @'
     const refreshUsageFromApi = async () => {
-      if ((await refreshAccountMode()) !== "official") return false;
+      if (disposed) return false;
+      if ((await refreshAccountMode()) === "api" || disposed) return false;
+'@)
+$sourceText = $sourceText.Replace(@'
+      if (disposed) return;
+      await refreshUsageFromApi();
+      if (disposed) return;
+      if (!directUsageAvailable) {
+'@, @'
+      if (disposed) return;
+      const mode = await refreshAccountMode();
+      if (disposed) return;
+      if (mode !== "api") await refreshUsageFromApi();
+      if (disposed) return;
+      if (accountMode !== "api" && !directUsageAvailable) {
 '@)
 $sourceText = $sourceText.Replace(@'
         refreshUsageFromApi();
 '@, @'
         refreshAccountMode().then((mode) => {
-          if (mode === "official") refreshUsageFromApi();
+          if (mode !== "api") refreshUsageFromApi();
         });
 '@)
-$sourceText = $sourceText.Replace('        if (!directUsageAvailable) {', '        if (accountMode === "official" && !directUsageAvailable) {')
-$sourceText = $sourceText.Replace(@'
-  /** Pull the entry for `kind` out of the live snapshot. */
-  const entryFor = (snap, k) => {
-    if (k === "5h") return snap.fiveHour;
-    if (k === "weekly") return snap.weekly;
-    return snap.points;
-  };
-  const isApiSnapshot = (snap) => !!snap?.apiMode || snap?.fiveHour?.apiMode;
-'@, @'
-  /** Pull the entry for `kind` out of the live snapshot. */
-  const entryFor = (snap, k) => {
-    if (k === "5h") return snap.fiveHour;
-    if (k === "weekly") return snap.weekly;
-    return snap.points;
-  };
-  const isApiSnapshot = (snap) => !!snap?.apiMode || snap?.fiveHour?.apiMode;
-'@)
+$sourceText = $sourceText.Replace('        if (!directUsageAvailable) {', '        if (accountMode !== "api" && !directUsageAvailable) {')
 $sourceText = $sourceText.Replace(@'
   const applyValueState = (snap) => {
     const entry = entryFor(snap, kind);
@@ -619,18 +668,37 @@ $sourceText = $sourceText.Replace(@'
 $sourceText = $sourceText.Replace('slot.appendChild(mounted);', "slot.appendChild(mounted);`n      lastMountedMode = slot.dataset.codexppUsageSlot || `"unknown`";")
 $sourceText = $sourceText.Replace('log("mounted usage box", {', "log(`"mounted usage box`", {`n        mode: lastMountedMode,")
 $sourceText = $sourceText.Replace('slot.dataset.codexppUsageSlot === "settings-inline-windows"', 'slot.dataset.codexppUsageSlot === "settings-inline-windows" || slot.dataset.codexppUsageSlot === "controls-inline"')
-$sourceText = $sourceText.Replace(@'
-      for (const slot of document.querySelectorAll('[data-codexpp="usage-slot"]')) {
-        if (slot instanceof HTMLElement && slot.children.length === 0) slot.remove();
-      }
-'@, @'
-      for (const slot of document.querySelectorAll('[data-codexpp="usage-slot"]')) {
-        if (slot instanceof HTMLElement && slot.children.length === 0) slot.remove();
-      }
-      for (const slot of document.querySelectorAll('[data-codexpp="usage-floating-slot"]')) {
-        slot.remove();
-      }
-'@)
+$requiredGeneratedMarkers = [ordered]@{
+  "usage default" = '"show-usage-in-sidebar": true'
+  "Markdown preview feature" = '"render-markdown-preview-math"(api)'
+  "sidebar candidate discovery" = 'const SIDEBAR_CANDIDATE_SELECTOR = ['
+  "account mode state" = 'let accountMode = "unknown"'
+  "account mode refresh" = 'const refreshAccountMode = async (force = false) => {'
+  "stable visible snapshot" = 'const displaySnapshot = () =>'
+  "visible snapshot refresh" = 'mounted._refresh?.(visibleSnapshot);'
+  "API snapshot renderer" = 'const isApiSnapshot = (snap) =>'
+  "disposed quota guard" = 'if ((await refreshAccountMode()) === "api" || disposed) return false;'
+  "mounted slot mode" = 'lastMountedMode = slot.dataset.codexppUsageSlot || "unknown";'
+}
+foreach ($entry in $requiredGeneratedMarkers.GetEnumerator()) {
+  if (-not $sourceText.Contains($entry.Value)) {
+    throw "Required migration transform failed: $($entry.Key)"
+  }
+}
+
+$singletonMarkers = @(
+  '"render-markdown-preview-math"(api)',
+  'const displaySnapshot = () =>',
+  'const isApiSnapshot = (snap) =>'
+)
+foreach ($marker in $singletonMarkers) {
+  if ([regex]::Matches($sourceText, [regex]::Escape($marker)).Count -ne 1) {
+    throw "Migration marker must occur exactly once: $marker"
+  }
+}
+if ($sourceText.Contains('let snapshot = null; // Do not render persisted quota data')) {
+  throw "Persisted quota snapshot was unexpectedly disabled"
+}
 
 $prefix = @'
 /*
@@ -656,7 +724,43 @@ $prefix = @'
   "use strict";
 
   const INSTALL_KEY = "__bennettUiImprovementsBigPizza";
-  const VERSION = "1.2.2";
+  const VERSION = "1.2.4";
+  const HISTORY_TARGET_STORAGE_KEY = "__codexListPagebusterTarget";
+  const HISTORY_TARGET_DEFAULT = 500;
+  const HISTORY_TARGET_MIN = 1;
+  const HISTORY_TARGET_MAX = 2000;
+  const SCRIPT_LOAD_ID = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const lifecycleTimers = new Set();
+  const lifecycleSignatures = new Set();
+
+  function reportLifecycle(event, detail = {}) {
+    const signature = `${event}:${JSON.stringify(detail)}`;
+    if (event === "usage-mounted" && lifecycleSignatures.has(signature)) return;
+    lifecycleSignatures.add(signature);
+    const payload = {
+      event: `bennett-ui.${event}`,
+      version: VERSION,
+      scriptLoadId: SCRIPT_LOAD_ID,
+      ...detail,
+    };
+    window.__bennettUiLastLifecycle = payload;
+    try {
+      const bridge = window.__codexSessionDeleteBridge;
+      if (typeof bridge === "function") {
+        Promise.resolve(bridge("/diagnostics/log", payload)).catch(() => {});
+      }
+    } catch (_) {}
+  }
+
+  function scheduleLifecycle(callback, delay) {
+    const timer = window.setTimeout(() => {
+      lifecycleTimers.delete(timer);
+      callback();
+    }, delay);
+    lifecycleTimers.add(timer);
+    return timer;
+  }
+
   const previous = window[INSTALL_KEY];
   if (previous && typeof previous.stop === "function") {
     try {
@@ -764,7 +868,15 @@ $suffix = @'
       status: "可用",
     },
   ];
-  const settingsObserver = new MutationObserver(installSettingsPanel);
+  let settingsScanTimer = 0;
+  const scheduleSettingsPanelInstall = () => {
+    if (settingsScanTimer) return;
+    settingsScanTimer = window.setTimeout(() => {
+      settingsScanTimer = 0;
+      installSettingsPanel();
+    }, 100);
+  };
+  const settingsObserver = new MutationObserver(scheduleSettingsPanelInstall);
   settingsObserver.observe(document.documentElement, { childList: true, subtree: true });
   installSettingsPanel();
 
@@ -793,14 +905,24 @@ $suffix = @'
 
   function installSettingsPanel() {
     const modal = document.querySelector(".codex-plus-modal-content");
-    if (!modal || modal.dataset.bennettUiSettingsVersion === VERSION) return;
+    if (!modal) return;
     const tabs = modal.querySelector(".codex-plus-tabs");
     const body = modal.querySelector(".codex-plus-modal-body");
     if (!tabs || !body) return;
+    const currentTab = tabs.querySelector('[data-codex-plus-tab="bennettUi"]');
+    const currentPanel = body.querySelector('[data-codex-plus-panel="bennettUi"]');
+    if (
+      modal.dataset.bennettUiSettingsLoadId === SCRIPT_LOAD_ID &&
+      currentTab &&
+      currentPanel
+    ) {
+      return;
+    }
     modal.dataset.bennettUiSettingsVersion = VERSION;
+    modal.dataset.bennettUiSettingsLoadId = SCRIPT_LOAD_ID;
 
-    tabs.querySelector('[data-codex-plus-tab="bennettUi"]')?.remove();
-    body.querySelector('[data-codex-plus-panel="bennettUi"]')?.remove();
+    tabs.querySelectorAll('[data-codex-plus-tab="bennettUi"]').forEach((node) => node.remove());
+    body.querySelectorAll('[data-codex-plus-panel="bennettUi"]').forEach((node) => node.remove());
 
     const tab = document.createElement("button");
     tab.type = "button";
@@ -817,6 +939,13 @@ $suffix = @'
     panel.innerHTML = settingsPanelHtml();
     panel.addEventListener("click", (event) => {
       const target = event.target instanceof Element ? event.target : event.target?.parentElement;
+      const historyLoad = target?.closest("[data-bennett-ui-history-load]");
+      if (historyLoad) {
+        event.preventDefault();
+        event.stopPropagation();
+        void loadHistoryFromSettings(panel);
+        return;
+      }
       const toggle = target?.closest("[data-bennett-ui-feature]");
       if (!toggle) return;
       event.preventDefault();
@@ -835,9 +964,8 @@ $suffix = @'
     return `
       <div class="codex-plus-row bennett-ui-settings-head">
         <div>
-          <div class="codex-plus-row-title">Bennett UI Improvements</div>
-          <div class="codex-plus-row-description">来源：b-nnett/codex-plusplus-bennett-ui。此迁移只保留能够在 BigPizzaV3 renderer-only 用户脚本环境中运行的功能。</div>
-          <div class="bennett-ui-settings-note">切换会尽量立即生效。如果 Codex DOM 变动导致残留，可重新加载用户脚本或重启 Codex++。</div>
+          <div class="codex-plus-row-title">Bennett UI Improvements ${escapeHtmlLocal(VERSION)}</div>
+          <div class="codex-plus-row-description">项目侧栏、额度显示、Markdown 预览与原生会话查询上限设置。</div>
         </div>
       </div>
       ${featureInfo.map((item) => `
@@ -850,7 +978,67 @@ $suffix = @'
           <button type="button" class="codex-plus-toggle bennett-ui-toggle" data-bennett-ui-feature="${escapeAttr(item.id)}" ${item.disabled ? "disabled" : ""}><span></span></button>
         </div>
       `).join("")}
+      <div class="codex-plus-row bennett-ui-history-row" data-bennett-ui-history-row="true">
+        <div class="bennett-ui-history-copy">
+          <div class="codex-plus-row-title">会话历史加载</div>
+          <div class="codex-plus-row-description">仅提高 Codex 原生近期会话查询上限，不扫描、合并、补写或重新渲染会话。每次打开 Codex 后自动请求一次，也可手动重试。范围 ${HISTORY_TARGET_MIN}–${HISTORY_TARGET_MAX} 条。</div>
+          <div class="bennett-ui-feature-status" data-bennett-ui-history-status="true">由 Codex 原生读取和渲染；启动后自动请求</div>
+        </div>
+        <div class="bennett-ui-history-controls">
+          <input type="number" min="${HISTORY_TARGET_MIN}" max="${HISTORY_TARGET_MAX}" step="50" value="${readHistoryTarget()}" inputmode="numeric" aria-label="历史会话查询上限" data-bennett-ui-history-limit="true">
+          <button type="button" class="bennett-ui-history-load" data-bennett-ui-history-load="true">重新加载历史</button>
+        </div>
+      </div>
     `;
+  }
+
+  function normalizeHistoryTarget(value, fallback = HISTORY_TARGET_DEFAULT) {
+    const parsed = Number.parseInt(String(value ?? ""), 10);
+    if (!Number.isFinite(parsed)) return fallback;
+    return Math.max(HISTORY_TARGET_MIN, Math.min(HISTORY_TARGET_MAX, parsed));
+  }
+
+  function readHistoryTarget() {
+    try {
+      return normalizeHistoryTarget(window.localStorage.getItem(HISTORY_TARGET_STORAGE_KEY));
+    } catch {
+      return HISTORY_TARGET_DEFAULT;
+    }
+  }
+
+  function writeHistoryTarget(value) {
+    const normalized = normalizeHistoryTarget(value);
+    try {
+      window.localStorage.setItem(HISTORY_TARGET_STORAGE_KEY, String(normalized));
+    } catch {
+      // The loader can still use the value for this run when storage is unavailable.
+    }
+    return normalized;
+  }
+
+  async function loadHistoryFromSettings(panel) {
+    const input = panel.querySelector("[data-bennett-ui-history-limit]");
+    const button = panel.querySelector("[data-bennett-ui-history-load]");
+    const status = panel.querySelector("[data-bennett-ui-history-status]");
+    const limit = writeHistoryTarget(input?.value);
+    if (input) input.value = String(limit);
+    if (button) button.disabled = true;
+    if (status) status.textContent = `正在请求 Codex 原生历史，上限 ${limit} 条…`;
+    try {
+      const loader = window.__bennettUiEmbeddedHistoryLoader || window.__codexListPagebuster;
+      if (!loader || typeof loader.refresh !== "function") {
+        throw new Error("内置会话加载器尚未就绪，请稍后重试");
+      }
+      loader.setLimit?.(limit);
+      await loader.refresh(limit);
+      if (status) {
+        status.textContent = `已请求 Codex 原生历史，上限 ${limit} 条；侧栏由 Codex 自己渲染`;
+      }
+    } catch (error) {
+      if (status) status.textContent = `加载失败：${error?.message || String(error)}`;
+    } finally {
+      if (button) button.disabled = false;
+    }
   }
 
   function refreshSettingsPanel() {
@@ -869,15 +1057,25 @@ $suffix = @'
     const style = document.createElement("style");
     style.id = "bennett-ui-settings-style";
     style.textContent = `
+      [data-codex-plus-panel="bennettUi"] {
+        color: #f3f4f6 !important;
+        color-scheme: dark;
+      }
+      [data-codex-plus-panel="bennettUi"] .codex-plus-row-title {
+        color: #f3f4f6 !important;
+      }
+      [data-codex-plus-panel="bennettUi"] .codex-plus-row-description {
+        color: #a1a1aa !important;
+      }
       .bennett-ui-settings-note,
       .bennett-ui-feature-status {
         margin-top: 6px;
-        color: var(--text-secondary, var(--color-token-text-secondary, #8b8b8b));
+        color: #a1a1aa !important;
         font-size: 12px;
         line-height: 1.35;
       }
       .bennett-ui-feature-row[data-enabled="true"] .bennett-ui-feature-status {
-        color: var(--text-primary, var(--color-token-text-primary, #f5f5f5));
+        color: #d1d5db !important;
       }
       .bennett-ui-toggle[disabled] {
         cursor: not-allowed;
@@ -885,6 +1083,56 @@ $suffix = @'
       }
       .bennett-ui-toggle[data-enabled="true"] span {
         transform: translateX(14px);
+      }
+      .bennett-ui-history-row {
+        align-items: center;
+        gap: 18px;
+      }
+      .bennett-ui-history-copy {
+        min-width: 0;
+        flex: 1 1 auto;
+      }
+      .bennett-ui-history-controls {
+        display: flex;
+        flex: 0 0 auto;
+        align-items: center;
+        gap: 10px;
+      }
+      .bennett-ui-history-controls input {
+        box-sizing: border-box;
+        width: 130px;
+        min-height: 34px;
+        border: 1px solid var(--border-default, rgba(127, 127, 127, 0.45));
+        border-radius: 8px;
+        background: var(--background-primary, color-mix(in srgb, currentColor 6%, transparent));
+        color: #f3f4f6;
+        padding: 5px 10px;
+      }
+      .bennett-ui-history-load {
+        min-height: 34px;
+        border: 1px solid var(--border-default, rgba(127, 127, 127, 0.45));
+        border-radius: 8px;
+        background: var(--background-secondary, color-mix(in srgb, currentColor 9%, transparent));
+        color: #f3f4f6;
+        cursor: pointer;
+        padding: 5px 12px;
+      }
+      .bennett-ui-history-load:hover:not(:disabled) {
+        background: var(--background-tertiary, color-mix(in srgb, currentColor 15%, transparent));
+      }
+      .bennett-ui-history-load:disabled {
+        cursor: wait;
+        opacity: 0.55;
+      }
+      @media (max-width: 720px) {
+        .bennett-ui-history-row,
+        .bennett-ui-history-controls {
+          align-items: stretch;
+          flex-direction: column;
+        }
+        .bennett-ui-history-controls input {
+          width: 100%;
+        }
       }
     `;
     document.head.appendChild(style);
@@ -911,22 +1159,60 @@ $suffix = @'
 
   window[INSTALL_KEY] = {
     version: VERSION,
+    scriptLoadId: SCRIPT_LOAD_ID,
     api,
     features,
     featureInfo,
-    setFeature(id, enabled, reload = true) {
+    setFeature(id, enabled, reload = false) {
       setFeatureEnabled(id, enabled);
       if (reload) window.location.reload();
     },
     stop() {
+      for (const timer of lifecycleTimers) window.clearTimeout(timer);
+      lifecycleTimers.clear();
+      const embeddedHistory = window.__bennettUiEmbeddedHistoryLoader;
+      if (embeddedHistory && typeof embeddedHistory.stop === "function") {
+        try {
+          embeddedHistory.stop();
+        } catch (error) {
+          console.warn("[Bennett UI/BigPizza] history stop failed", error);
+        }
+      }
+      if (window.__bennettUiEmbeddedHistoryLoader === embeddedHistory) {
+        delete window.__bennettUiEmbeddedHistoryLoader;
+      }
+      if (window.__codexListPagebuster === embeddedHistory) {
+        delete window.__codexListPagebuster;
+      }
       settingsObserver.disconnect();
-      document.querySelector('[data-codex-plus-tab="bennettUi"]')?.remove();
-      document.querySelector('[data-codex-plus-panel="bennettUi"]')?.remove();
+      if (settingsScanTimer) window.clearTimeout(settingsScanTimer);
+      document.querySelectorAll('[data-codex-plus-tab="bennettUi"]').forEach((node) => node.remove());
+      document.querySelectorAll('[data-codex-plus-panel="bennettUi"]').forEach((node) => node.remove());
+      const settingsModal = document.querySelector(".codex-plus-modal-content");
+      if (settingsModal?.dataset.bennettUiSettingsLoadId === SCRIPT_LOAD_ID) {
+        delete settingsModal.dataset.bennettUiSettingsLoadId;
+        delete settingsModal.dataset.bennettUiSettingsVersion;
+      }
+      document.getElementById("bennett-ui-settings-style")?.remove();
       if (typeof tweak.stop === "function") {
         tweak.stop.call(tweak);
       }
     },
   };
+
+  reportLifecycle("script-loaded", {
+    readyState: document.readyState,
+    activeFeatures: Array.from(tweak._state?.features?.keys?.() || []),
+  });
+  scheduleLifecycle(() => {
+    const usageBox = document.querySelector('[data-codexpp="usage-box"], [data-codexpp="usage-boxes"]');
+    reportLifecycle("script-settled", {
+      activeFeatures: Array.from(tweak._state?.features?.keys?.() || []),
+      usageMounted: Boolean(usageBox),
+      usageSlotMode: usageBox?.parentElement?.dataset?.codexppUsageSlot || "",
+      asideCount: document.querySelectorAll("aside").length,
+    });
+  }, 1500);
 
   function createBigPizzaRendererApi() {
     const storagePrefix = "bennett-ui-improvements:";
@@ -989,7 +1275,30 @@ $suffix = @'
 })();
 '@
 
-$content = $prefix + $sourceText + $suffix
+$content = $prefix + $sourceText + $suffix + @"
+
+
+/* BEGIN BENNETT EMBEDDED NATIVE HISTORY LOADER */
+$nativeHistoryFeature
+/* END BENNETT EMBEDDED NATIVE HISTORY LOADER */
+"@
 $content = [regex]::Replace($content, "`n{4,}(?=  const tweak = module\.exports;)", "`n`n")
+if ([regex]::Matches($content, 'BEGIN BENNETT EMBEDDED NATIVE HISTORY LOADER').Count -ne 1) {
+  throw "Embedded native history loader must occur exactly once"
+}
+if (-not $content.Contains('window.__bennettUiEmbeddedHistoryLoader = window[SCRIPT_KEY];')) {
+  throw "Embedded native history loader export is missing"
+}
+$requiredReleaseMarkers = @(
+  'const VERSION = "1.2.4";',
+  'data-bennett-ui-history-load="true"',
+  'scheduleScriptLoadHistoryRefresh();',
+  'if ((await refreshAccountMode()) === "api" || disposed) return false;'
+)
+foreach ($marker in $requiredReleaseMarkers) {
+  if (-not $content.Contains($marker)) {
+    throw "Required release marker is missing: $marker"
+  }
+}
 Set-Content -LiteralPath $outPath -Value $content -NoNewline -Encoding utf8
 Write-Output $outPath

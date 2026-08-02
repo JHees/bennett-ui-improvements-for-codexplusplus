@@ -304,6 +304,12 @@ function activateFeature(state, id) {
     state.api.log.info("activated", id);
   } catch (e) {
     state.api.log.error("activate failed", id, e);
+    if (typeof reportLifecycle === "function") {
+      reportLifecycle("feature-activation-failed", {
+        feature: id,
+        error: String(e?.stack || e),
+      });
+    }
   }
 }
 
@@ -391,18 +397,19 @@ const FEATURES = {
       for (const c of CONTAINS) if (text.includes(c)) return true;
       return false;
     };
-    const scan = () => {
-      const candidates = document.querySelectorAll(
-        'button, a, [role="button"], [role="menuitem"]',
-      );
+    const CANDIDATE_SELECTOR = 'button, a, [role="button"], [role="menuitem"]';
+    const scanRoot = (root) => {
+      const candidates = [];
+      if (root instanceof Element && root.matches(CANDIDATE_SELECTOR)) candidates.push(root);
+      if (root?.querySelectorAll) candidates.push(...root.querySelectorAll(CANDIDATE_SELECTOR));
       for (const el of candidates) {
-        if (hidden.has(el)) continue;
         if (isInsideOurShell(el)) continue;
         const t = normText(el);
         if (t.length === 0 || t.length > 80) continue;
         if (!matches(el, t)) continue;
         const host = el.closest('[class*="rounded"], [class*="badge"]') || el;
         if (!(host instanceof HTMLElement)) continue;
+        if (hidden.has(host)) continue;
         host.dataset.codexppPrevDisplay = host.style.display || "";
         host.style.display = "none";
         hidden.add(host);
@@ -410,12 +417,38 @@ const FEATURES = {
       }
     };
 
-    scan();
-    const obs = new MutationObserver(scan);
+    let scanTimer = 0;
+    const pendingRoots = new Set();
+    const flushPendingRoots = () => {
+      scanTimer = 0;
+      const roots = Array.from(pendingRoots);
+      pendingRoots.clear();
+      for (const root of roots) scanRoot(root);
+    };
+    const scheduleRoots = (records) => {
+      for (const record of records) {
+        for (const node of record.addedNodes) {
+          const root = node instanceof Element ? node : node.parentElement;
+          if (root instanceof Element) pendingRoots.add(root);
+        }
+      }
+      if (!pendingRoots.size) return;
+      if (pendingRoots.size > 40) {
+        pendingRoots.clear();
+        pendingRoots.add(document.documentElement);
+      }
+      if (scanTimer) window.clearTimeout(scanTimer);
+      scanTimer = window.setTimeout(flushPendingRoots, 100);
+    };
+
+    scanRoot(document);
+    const obs = new MutationObserver(scheduleRoots);
     obs.observe(document.documentElement, { childList: true, subtree: true });
 
     return () => {
       obs.disconnect();
+      if (scanTimer) window.clearTimeout(scanTimer);
+      pendingRoots.clear();
       for (const el of hidden) {
         if ("codexppPrevDisplay" in el.dataset) {
           el.style.display = el.dataset.codexppPrevDisplay;
@@ -461,6 +494,7 @@ const FEATURES = {
     let usageBridgeReadyLogged = false;
     let usageBridgeScriptInjected = false;
     let bridgeRequestSeq = 0;
+    let disposed = false;
 
     const log = (...a) => api.log.info("[usage]", ...a);
     const ASIDE_SELECTOR = [
@@ -486,6 +520,7 @@ const FEATURES = {
     };
 
     const applySnapshot = (partial, source) => {
+      if (disposed) return false;
       if (
         !partial?.fiveHour &&
         !partial?.weekly &&
@@ -537,7 +572,7 @@ const FEATURES = {
             hasElectronBridge: typeof window.electronBridge?.sendMessageFromView === "function",
           },
         }));
-        window.addEventListener("codexpp-usage-request", (event) => {
+        const onRequest = (event) => {
           const message = event.detail;
           if (!message || typeof message !== "object" || !message.requestId) return;
           pending.add(message.requestId);
@@ -552,8 +587,8 @@ const FEATURES = {
           });
           if (forwarded) forwardedEvent.__codexForwardedViaBridge = true;
           window.dispatchEvent(forwardedEvent);
-        });
-        window.addEventListener("message", (event) => {
+        };
+        const onMessage = (event) => {
           const data = event.data;
           if (
             !data ||
@@ -571,34 +606,35 @@ const FEATURES = {
             type: "codexpp-usage-response",
             detail: data,
           }, "*");
-        });
+        };
+        const stop = () => {
+          window.removeEventListener("codexpp-usage-request", onRequest);
+          window.removeEventListener("message", onMessage);
+          window.__codexppUsageBridgeInstalled = false;
+        };
+        window.addEventListener("codexpp-usage-request", onRequest);
+        window.addEventListener("message", onMessage);
+        window.addEventListener("codexpp-usage-bridge-stop", stop, { once: true });
       })();`;
       (document.head || document.documentElement).appendChild(script);
       script.remove();
     };
 
     const dispatchCodexViewMessage = (message) => {
-      ensureUsageBridgeScript();
-      window.dispatchEvent(
-        new CustomEvent("codexpp-usage-request", { detail: message }),
-      );
-
-      let forwarded = false;
       const bridge = window.electronBridge;
       if (typeof bridge?.sendMessageFromView === "function") {
-        forwarded = true;
         bridge.sendMessageFromView(message).catch((e) => {
           if (!directUsageFailureLogged) {
             directUsageFailureLogged = true;
             api.log.warn("[usage] bridge send failed", e);
           }
         });
+        return;
       }
-      const event = new CustomEvent("codex-message-from-view", {
-        detail: message,
-      });
-      if (forwarded) event.__codexForwardedViaBridge = true;
-      window.dispatchEvent(event);
+      ensureUsageBridgeScript();
+      window.dispatchEvent(
+        new CustomEvent("codexpp-usage-request", { detail: message }),
+      );
     };
 
     const fetchCodexAppServerJson = async (url, timeoutMs = 10_000) => {
@@ -860,6 +896,7 @@ const FEATURES = {
     };
 
     const refreshUsageFromApi = async () => {
+      if (disposed) return false;
       if (directUsageInFlight) return false;
       const now = Date.now();
       if (directUsageLastAttemptAt && now - directUsageLastAttemptAt < 60_000) {
@@ -869,6 +906,7 @@ const FEATURES = {
       directUsageInFlight = true;
       try {
         const status = await fetchCodexAppServerJson("/wham/usage");
+        if (disposed) return false;
         const partial = snapshotFromUsageStatus(status);
         if (partial.fiveHour || partial.weekly) {
           directUsageAvailable = true;
@@ -1057,6 +1095,7 @@ const FEATURES = {
     };
 
     const ensureMounted = (forceRebuild = false) => {
+      if (disposed) return;
       if (!snapshot || (!snapshot.fiveHour && !snapshot.weekly)) return;
       const slot = findSidebarSlot();
       if (!slot) {
@@ -1071,6 +1110,11 @@ const FEATURES = {
         }
         if (!ensureMounted._warned) {
           log("ensureMounted: no sidebar slot found yet");
+          if (typeof reportLifecycle === "function") {
+            reportLifecycle("usage-slot-missing", {
+              asideCount: document.querySelectorAll("aside").length,
+            });
+          }
           ensureMounted._warned = true;
         }
         return;
@@ -1105,6 +1149,11 @@ const FEATURES = {
         slotTag: slot.tagName,
         slotClass: slot.className,
       });
+      if (typeof reportLifecycle === "function") {
+        reportLifecycle("usage-mounted", {
+          mode: slot.dataset.codexppUsageSlot || "unknown",
+        });
+      }
     };
 
     // Initial render from persisted snapshot (so first paint isn't empty
@@ -1112,27 +1161,42 @@ const FEATURES = {
     ensureMounted(true);
 
     // ── observers ─────────────────────────────────────────────────────
-    // We throttle to one tick per animation frame so a flood of React
-    // re-renders can't tank the renderer (Codex mutates the DOM heavily
-    // while typing). Coalesces N onMutate() calls into one scan.
+    // React can emit hundreds of mutations while restoring the history list.
+    // Ignore our own UI and editor churn, then coalesce the rest into one scan.
     let scheduled = false;
+    let scheduleTimer = 0;
+    const runMutationScan = async () => {
+      if (disposed) return;
+      await refreshUsageFromApi();
+      if (disposed) return;
+      if (!directUsageAvailable) {
+        const grid = findBreakdownGrid();
+        if (grid) scanBreakdown(grid);
+        scanCompactUsage();
+      }
+      ensureMounted();
+    };
     const onMutate = () => {
       if (scheduled) return;
       scheduled = true;
-      requestAnimationFrame(() => {
+      scheduleTimer = window.setTimeout(() => {
+        scheduleTimer = 0;
         scheduled = false;
-        refreshUsageFromApi();
-        if (!directUsageAvailable) {
-          const grid = findBreakdownGrid();
-          if (grid) scanBreakdown(grid);
-          scanCompactUsage();
-        }
-        ensureMounted();
-      });
+        void runMutationScan();
+      }, 1000);
     };
 
     onMutate();
-    const obs = new MutationObserver(onMutate);
+    const IGNORED_MUTATION_SELECTOR =
+      "[data-codexpp], [data-codex-composer-root], [data-codex-composer='true'], [contenteditable='true'], textarea, [data-composer-overlay-floating-ui]";
+    const obs = new MutationObserver((records) => {
+      const relevant = records.some((record) => {
+        const target = record.target;
+        const element = target instanceof Element ? target : target?.parentElement;
+        return !(element instanceof Element && element.closest(IGNORED_MUTATION_SELECTOR));
+      });
+      if (relevant) onMutate();
+    });
     obs.observe(document.documentElement, { childList: true, subtree: true });
     const interval = window.setInterval(onMutate, 15_000);
     window.addEventListener("focus", onMutate);
@@ -1142,8 +1206,13 @@ const FEATURES = {
     log("active", { snapshot });
 
     return () => {
+      disposed = true;
+      if (usageBridgeScriptInjected) {
+        window.dispatchEvent(new CustomEvent("codexpp-usage-bridge-stop"));
+      }
       obs.disconnect();
       window.clearInterval(interval);
+      if (scheduleTimer) window.clearTimeout(scheduleTimer);
       window.removeEventListener("focus", onMutate);
       window.removeEventListener("message", onUsageMessage);
       document.removeEventListener("visibilitychange", onMutate);
@@ -1153,6 +1222,9 @@ const FEATURES = {
       }
       for (const slot of document.querySelectorAll('[data-codexpp="usage-slot"]')) {
         if (slot instanceof HTMLElement && slot.children.length === 0) slot.remove();
+      }
+      for (const slot of document.querySelectorAll('[data-codexpp="usage-floating-slot"]')) {
+        slot.remove();
       }
     };
   },
@@ -4554,25 +4626,46 @@ const FEATURES = {
       activeOriginals = originals;
     };
 
-    let scheduled = false;
-    const scheduleApply = () => {
-      if (scheduled) return;
-      scheduled = true;
-      requestAnimationFrame(() => {
-        scheduled = false;
+    let applyTimer = 0;
+    const scheduleApply = (delay = 120) => {
+      if (applyTimer) window.clearTimeout(applyTimer);
+      applyTimer = window.setTimeout(() => {
+        applyTimer = 0;
         apply();
+      }, delay);
+    };
+    const mutationsTouchActions = (records) => {
+      if (!activeOriginals.length || activeOriginals.some((node) => !node.isConnected)) {
+        return true;
+      }
+      return records.some((record) => {
+        const target = record.target instanceof Element
+          ? record.target
+          : record.target?.parentElement;
+        if (
+          target instanceof Element &&
+          activeOriginals.some((button) => target === button || target.contains(button) || button.contains(target))
+        ) {
+          return true;
+        }
+        return [...record.addedNodes, ...record.removedNodes].some((node) =>
+          node instanceof Element && activeOriginals.some((button) => node === button || node.contains(button)),
+        );
       });
     };
 
     clearStaleNodes();
     apply();
-    const obs = new MutationObserver(scheduleApply);
+    const obs = new MutationObserver((records) => {
+      if (mutationsTouchActions(records)) scheduleApply();
+    });
     obs.observe(document.body, { childList: true, subtree: true });
 
     api.log.info("sidebar action grid active");
 
     return () => {
       obs.disconnect();
+      if (applyTimer) window.clearTimeout(applyTimer);
       removeWrapper();
       cleanupMarks();
       style.remove();
@@ -5347,9 +5440,10 @@ const FEATURES = {
       markRows(rows);
     };
 
-
+    let activeSidebar = null;
     const apply = () => {
       const sidebar = mainSidebar();
+      activeSidebar = sidebar instanceof HTMLElement ? sidebar : null;
       if (!sidebar) {
         return;
       }
@@ -5411,15 +5505,10 @@ const FEATURES = {
     };
 
     let scheduled = false;
-    let scheduleFrame = 0;
     let scheduleTimer = 0;
     const runScheduledApply = () => {
       if (!scheduled) return;
       scheduled = false;
-      if (scheduleFrame) {
-        cancelAnimationFrame(scheduleFrame);
-        scheduleFrame = 0;
-      }
       if (scheduleTimer) {
         window.clearTimeout(scheduleTimer);
         scheduleTimer = 0;
@@ -5428,20 +5517,33 @@ const FEATURES = {
       apply();
     };
 
-    const scheduleApply = () => {
-      if (scheduled || disposed) return;
+    const scheduleApply = (delay = 140) => {
+      if (disposed) return;
       scheduled = true;
-      scheduleFrame = requestAnimationFrame(runScheduledApply);
-      scheduleTimer = window.setTimeout(runScheduledApply, 80);
+      if (scheduleTimer) window.clearTimeout(scheduleTimer);
+      scheduleTimer = window.setTimeout(runScheduledApply, delay);
     };
 
-    let childListFrame = 0;
-    const scheduleApplySoon = () => {
-      if (disposed || childListFrame) return;
-      childListFrame = requestAnimationFrame(() => {
-        childListFrame = 0;
-        scheduleApply();
+    const scheduleApplyForMutations = (records) => {
+      if (disposed) return;
+      const sidebar = activeSidebar?.isConnected ? activeSidebar : null;
+      const relevant = records.some((record) => {
+        const target = record.target instanceof Element
+          ? record.target
+          : record.target?.parentElement;
+        if (sidebar && target instanceof Element && (target === sidebar || sidebar.contains(target))) {
+          return true;
+        }
+        return [...record.addedNodes, ...record.removedNodes].some((node) =>
+          node instanceof Element && (
+            node.matches?.(ASIDE_SELECTOR) ||
+            node.querySelector?.(ASIDE_SELECTOR) ||
+            node.hasAttribute?.("data-app-action-sidebar-project-id") ||
+            node.querySelector?.("[data-app-action-sidebar-project-id]")
+          ),
+        );
       });
+      if (relevant) scheduleApply();
     };
 
     apply();
@@ -5449,20 +5551,16 @@ const FEATURES = {
     const retryTimers = [250, 1000, 2500].map((delay) =>
       window.setTimeout(scheduleApply, delay),
     );
-    const observer = new MutationObserver(scheduleApplySoon);
+    const observer = new MutationObserver(scheduleApplyForMutations);
     observer.observe(document.body, {
       attributes: true,
       attributeFilter: [
         "aria-label",
-        "class",
         "data-app-action-sidebar-project-collapsed",
         "data-app-action-sidebar-project-id",
         "data-app-action-sidebar-project-label",
         "data-app-action-sidebar-project-row",
-        "data-codexpp-sidebar-project-expanded",
-        ATTR,
         "role",
-        "style",
       ],
       childList: true,
       subtree: true,
@@ -5470,23 +5568,23 @@ const FEATURES = {
     document.addEventListener("contextmenu", onProjectContextMenu, true);
     document.addEventListener("pointerdown", onProjectOverflowTrigger, true);
     document.addEventListener("click", onProjectOverflowTrigger, true);
-    window.addEventListener("focus", scheduleApply);
-    document.addEventListener("visibilitychange", scheduleApply);
+    const onWindowFocus = () => scheduleApply();
+    const onVisibilityChange = () => scheduleApply();
+    window.addEventListener("focus", onWindowFocus);
+    document.addEventListener("visibilitychange", onVisibilityChange);
 
     api.log.info("sidebar project backgrounds active");
 
     return () => {
       disposed = true;
       observer.disconnect();
-      if (childListFrame) cancelAnimationFrame(childListFrame);
-      if (scheduleFrame) cancelAnimationFrame(scheduleFrame);
       if (scheduleTimer) window.clearTimeout(scheduleTimer);
       retryTimers.forEach((timer) => window.clearTimeout(timer));
       document.removeEventListener("contextmenu", onProjectContextMenu, true);
       document.removeEventListener("pointerdown", onProjectOverflowTrigger, true);
       document.removeEventListener("click", onProjectOverflowTrigger, true);
-      window.removeEventListener("focus", scheduleApply);
-      document.removeEventListener("visibilitychange", scheduleApply);
+      window.removeEventListener("focus", onWindowFocus);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
       closeMenu();
       clearMarks();
       style.remove();
@@ -5785,6 +5883,7 @@ function renderUsageBox(api, snapshot) {
     if (k === "weekly") return snap.weekly;
     return snap.points;
   };
+  const isApiSnapshot = (snap) => !!snap?.apiMode || !!snap?.fiveHour?.apiMode;
 
   /** Apply colors + text for the *value* state (i.e. not hover). */
   const applyValueState = (snap) => {
