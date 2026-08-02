@@ -656,13 +656,15 @@
           }
           const mimeType = imageMimeType(resolved, result.mimeType);
           if (!mimeType) throw new Error("文件不是支持的图片格式");
-          entry.bytes = Math.ceil(result.contentsBase64.length * 0.75);
-          imageCacheBytes += entry.bytes;
-          while (imageCacheBytes > IMAGE_CACHE_MAX_BYTES && imageCache.size > 1) {
-            const oldestKey = imageCache.keys().next().value;
-            const oldest = imageCache.get(oldestKey);
-            imageCache.delete(oldestKey);
-            imageCacheBytes = Math.max(0, imageCacheBytes - (oldest?.bytes || 0));
+          if (imageCache.get(key) === entry) {
+            entry.bytes = Math.ceil(result.contentsBase64.length * 0.75);
+            imageCacheBytes += entry.bytes;
+            while (imageCacheBytes > IMAGE_CACHE_MAX_BYTES && imageCache.size > 1) {
+              const oldestKey = imageCache.keys().next().value;
+              const oldest = imageCache.get(oldestKey);
+              imageCache.delete(oldestKey);
+              imageCacheBytes = Math.max(0, imageCacheBytes - (oldest?.bytes || 0));
+            }
           }
           return `data:${mimeType};base64,${result.contentsBase64}`;
         })
