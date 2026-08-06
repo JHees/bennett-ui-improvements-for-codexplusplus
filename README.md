@@ -26,7 +26,7 @@ This project adapts [b-nnett/codex-plusplus-bennett-ui](https://github.com/b-nne
 | History | Raise Codex's native recent-history query limit from 50 to a configurable 1–2000 without taking over conversation management. |
 | Markdown | KaTeX formulas, math tables, images, relative image paths, and source inspection in `.md` previews. |
 | Settings | A dedicated Bennett UI panel with per-feature switches and a native-history load control. |
-| Noise reduction | Hides the Codex quota aside and Plus/Pro upsell surfaces while preserving the composer and app-update notices. Uses event-driven observers without periodic polling. |
+| Noise reduction | Hides Codex quota-exhaustion and Plus/Pro upgrade prompts while keeping the composer and app-update notices visible. |
 
 ## Install
 
@@ -68,14 +68,12 @@ Feature switches and the history loader are available under **Codex++ Management
 
 ## Native history query limit
 
-The embedded helper now has exactly one responsibility: ask Codex to refresh its own recent-conversation list with a larger limit.
+Bennett UI lets Codex show more of its own recent conversations without replacing Codex's conversation management.
 
-- Set a query limit from **1–2000**; the default is **500**, replacing Codex's native default of 50.
-- The request runs once whenever Codex starts. Startup failures receive limited retries, and **Reload history** provides a manual retry.
-- The plugin only invokes Codex's native `refresh-recent-conversations-for-host` action and stores one local numeric preference.
-- It does not call `thread/list` or `thread/read`, scan JSONL/SQLite, merge or migrate providers, or modify conversations, summaries, pins, archives, or projects.
-- It does not hydrate conversations, maintain history snapshots, inject sidebar rows, expand projects, or render the list. Codex alone controls the initial project rows and the **Show more** behavior.
-- History already unified by Codex/CC Switch remains indexed, deduplicated, and provider-selected by those systems; Bennett no longer participates in that workflow.
+- Choose a limit from **1–2000**; the default is **500** instead of Codex's usual 50.
+- The list refreshes automatically when Codex opens.
+- Use **Reload history** in Bennett UI Settings whenever you want to refresh it manually.
+- Codex and CC Switch continue to manage unified history, project grouping, ordering, and **Show more** behavior.
 
 If a standalone Pagebuster installation is still enabled, both scripts use the same global entry point and hand off to a single active instance. Once Bennett UI is working, the standalone Pagebuster script can be removed.
 
@@ -92,9 +90,9 @@ When CC Switch unified session history is enabled, CC Switch/Codex still own the
 
 ## Quota-prompt filtering
 
-- The filter targets Codex's known quota-exhaustion aside (`aside:has(h3):has(button)`) and pricing dialog surfaces, then confirms quota, reset, and upgrade text before hiding them.
-- The main page uses its existing DOM mutation observer. Embedded ChatGPT webviews receive one scoped observer when they become ready or navigate, so later prompt insertion is handled without a timer.
-- The filter does not scan every text node, poll every 1.5 seconds, or touch conversation articles, the composer, or Codex update notices.
+- Hides Codex quota-exhaustion notices and upgrade prompts while keeping conversation content, the composer, and app-update notices visible.
+- Works in both the main Codex interface and embedded ChatGPT views.
+- Enable or disable it from **Codex++ Management Tools → Bennett UI Settings**.
 
 ## Markdown preview
 
@@ -110,60 +108,11 @@ The right-side Markdown preview supports:
 
 ## Compatibility
 
-Bennett UI runs entirely in the BigPizzaV3 renderer user-script environment.
-
-| Capability | Status |
-| --- | --- |
-| DOM, CSS, settings UI, and renderer bridge features | Supported |
-| Native recent-conversation refresh action | Supported |
-| Legacy main-process filesystem access | Not available |
-| Legacy Electron IPC batch actions | Partially available or unavailable |
-| Modification of official Codex installation files | Never performed |
-
-DOM-dependent features may need updates after major Codex UI changes. Reloading user scripts is the first troubleshooting step.
+Bennett UI runs as a Codex++ user script and does not modify the official Codex installation. Features that depend on Codex's interface may need updates after major Codex releases. If something looks wrong, reload the user scripts first.
 
 ## Optional companion script
 
 [`scripts/hidden-user-message-visibility-fix.js`](scripts/hidden-user-message-visibility-fix.js) is an independent compatibility fix for user messages hidden by conversation compaction or steering-rendering issues. It is not part of the Bennett UI core script.
-
-## Debugging
-
-```js
-// Bennett UI instance and feature controls
-window.__bennettUiImprovementsBigPizza
-window.__bennettUiImprovementsBigPizza.setFeature("sidebar-action-grid", false)
-window.__bennettUiImprovementsBigPizza.setFeature("render-markdown-preview-math", true)
-
-// Markdown preview diagnostics
-window.__bennettMarkdownPreviewMath?.getStats()
-
-// Embedded native-history loader diagnostics
-window.__bennettUiEmbeddedHistoryLoader?.status()
-window.__codexListPagebuster?.status()
-```
-
-## Release packaging
-
-The release artifact is a single JavaScript file. Rebuild it from the migrated Bennett source and both embedded feature sources with:
-
-```powershell
-.\tools\build-migrated-script.ps1
-```
-
-The builder applies the BigPizzaV3 compatibility transforms, embeds the current Markdown and native-history feature sources, validates required release markers, and writes [`scripts/bennett-ui-improvements.js`](scripts/bennett-ui-improvements.js). Repeated builds are deterministic. [`tools/embed-native-history.ps1`](tools/embed-native-history.ps1) remains available only for replacing the history block in an already generated artifact.
-
-## Repository layout
-
-| Path | Purpose |
-| --- | --- |
-| `scripts/bennett-ui-improvements.js` | Installable single-file release artifact |
-| `features/native-history-loader.js` | Embedded native-history query-limit helper source |
-| `features/markdown-preview-math.js` | Markdown preview enhancement source |
-| `scripts/hidden-user-message-visibility-fix.js` | Optional independent compatibility script |
-| `tools/build-migrated-script.ps1` | Canonical one-step release builder |
-| `tools/embed-native-history.ps1` | History-block-only maintenance helper |
-| `market-entry.json` | Codex++ Script Market metadata |
-| `NOTICE.md` | Upstream attribution and license notices |
 
 ## Credits and license
 
