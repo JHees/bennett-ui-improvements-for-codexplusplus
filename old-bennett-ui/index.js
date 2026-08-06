@@ -1237,9 +1237,33 @@ const FEATURES = {
     const resetRe = /(额度将于|继续使用\s*Codex|升级至\s*Plus|quota\s+will\s+reset|limit\s+will\s+reset|rate\s+limit\s+resets|reset|重置|upgrade\s+to\s+plus)/i;
     const usageCardRe = /(剩余\s*\d+%\s*使用量|remaining\s+\d+%\s+usage|usage\s+remaining|reset\s+frequency|next\s+reset)/i;
     const actionRe = /(升级|Plus|upgrade|pricing|重置|reset|限额|额度|限制|limit|quota)/i;
+    const quotaDialogSelector = [
+      "[role='dialog']",
+      "[aria-modal='true']",
+      "[data-radix-dialog-content]",
+      "[data-slot='dialog-content']",
+      "[data-testid*='pricing' i]",
+    ].join(",");
+    const quotaSurfaceSelector = [
+      "[role='alert']",
+      "[role='status']",
+      "[aria-live]",
+      quotaDialogSelector,
+      "[data-testid*='quota' i]",
+      "[data-testid*='usage' i]",
+      "[data-test*='quota' i]",
+      "[data-test*='usage' i]",
+      "[class*='toast' i]",
+      "[class*='alert' i]",
+      "[class*='banner' i]",
+      "[class*='modal' i]",
+      "aside:has(h3):has(button)",
+    ].join(",");
     const hidden = new Set();
     let observer = null;
     let timer = 0;
+    const guestPending = new WeakSet();
+    const guestListeners = new Map();
 
     const textOf = (node) => String(node?.innerText || node?.textContent || "").replace(/\s+/g, " ").trim();
     const visibleBox = (node) => {
@@ -1252,27 +1276,175 @@ const FEATURES = {
     const touchesUsageControl = (node) => Boolean(node.closest("[data-codexpp='usage-slot'], [data-codexpp='usage-box'], [data-codexpp='usage-boxes']"));
     const shouldHide = (node) => {
       if (!(node instanceof HTMLElement) || node.closest("[data-message-author-role], article")) return false;
-      if (!node.matches("[role='alert'], [role='status'], [aria-live]")) return false;
+      if (!node.matches(quotaSurfaceSelector)) return false;
       if (!visibleBox(node)) return false;
       if (hasEditable(node) || touchesUsageControl(node)) return false;
       const text = textOf(node);
-      if (text.length < 12 || text.length > 500) return false;
+      if (text.length < 12 || text.length > (node.matches(quotaDialogSelector) ? 4_000 : 500)) return false;
       const rect = node.getBoundingClientRect();
       const bannerLike = rect.width >= 300 && rect.height >= 30 && rect.height <= 240 && quotaRe.test(text) && resetRe.test(text);
       const cardLike = rect.width >= 160 && rect.width <= 560 && rect.height >= 70 && rect.height <= 340 && usageCardRe.test(text) && hasAction(node, text);
-      return (bannerLike || cardLike) && hasAction(node, text);
+      const dialogLike = node.matches(quotaDialogSelector) && quotaRe.test(text) && (resetRe.test(text) || actionRe.test(text));
+      return (bannerLike || cardLike || dialogLike) && (hasAction(node, text) || dialogLike);
+    };
+    const findHideTarget = (node) => {
+      if (!node.matches(quotaDialogSelector)) return node;
+      const viewportWidth = window.innerWidth || document.documentElement.clientWidth || 1;
+      const viewportHeight = window.innerHeight || document.documentElement.clientHeight || 1;
+      const nodeRect = node.getBoundingClientRect();
+      if (nodeRect.width >= viewportWidth * 0.8 && nodeRect.height >= viewportHeight * 0.8) return node;
+      let current = node;
+      for (let depth = 0; depth < 4; depth += 1) {
+        const parent = current.parentElement;
+        if (!parent || parent === document.body || parent === document.documentElement) break;
+        const protectedContent = parent.querySelector("[data-message-author-role], article, input, textarea, [contenteditable='true'], [role='textbox'], [data-codexpp='usage-slot'], [data-codexpp='usage-box']");
+        const compactSurface = textOf(parent).length <= 800 && !protectedContent;
+        const rect = parent.getBoundingClientRect();
+        const position = window.getComputedStyle(parent).position;
+        const coversViewport = rect.width >= viewportWidth * 0.8 && rect.height >= viewportHeight * 0.8;
+        const portalLike = parent.matches("[data-radix-portal], [data-portal], [class*='portal' i]") || Boolean(parent.querySelector("[data-radix-dialog-overlay], [data-slot='dialog-overlay'], [class*='backdrop' i], [class*='overlay' i]"));
+        if (compactSurface && (portalLike || (coversViewport && (position === "fixed" || position === "absolute")))) return parent;
+        current = parent;
+      }
+      return node;
+    };
+    const scanGuestUsage = () => {
+      const STYLE_ID = "codex-plus-hide-usage-alert-style";
+      const HIDDEN_ATTR = "data-codex-plus-hidden-usage-alert";
+      const STATE_KEY = "__codexPlusUsageAlertGuestState";
+      const state = window[STATE_KEY] || { observer: null, timer: 0 };
+      window[STATE_KEY] = state;
+      const quotaRe = /(Codex\s*消息限额已用尽|消息限额已用尽|message\s+limit|usage\s+limit|out\s+of\s+Codex\s+messages|额度|限额|quota|rate\s+limit)/i;
+      const resetRe = /(额度将于|继续使用\s*Codex|升级至\s*Plus|quota\s+will\s+reset|limit\s+will\s+reset|rate\s+limit\s+resets|reset|重置|upgrade\s+to\s+plus)/i;
+      const usageCardRe = /(剩余\s*\d+%\s*使用量|remaining\s+\d+%\s+usage|usage\s+remaining|reset\s+frequency|next\s+reset)/i;
+      const actionRe = /(升级|Plus|upgrade|pricing|重置|reset|限额|额度|限制|limit|quota)/i;
+      const quotaDialogSelector = [
+        "[role='dialog']",
+        "[aria-modal='true']",
+        "[data-radix-dialog-content]",
+        "[data-slot='dialog-content']",
+        "[data-testid*='pricing' i]",
+      ].join(",");
+      const quotaSurfaceSelector = [
+        "[role='alert']",
+        "[role='status']",
+        "[aria-live]",
+        quotaDialogSelector,
+        "[data-testid*='quota' i]",
+        "[data-testid*='usage' i]",
+        "[data-test*='quota' i]",
+        "[data-test*='usage' i]",
+        "[class*='toast' i]",
+        "[class*='alert' i]",
+        "[class*='banner' i]",
+        "[class*='modal' i]",
+        "aside:has(h3):has(button)",
+      ].join(",");
+      const textOf = (node) => String(node?.innerText || node?.textContent || "").replace(/\s+/g, " ").trim();
+      const visibleBox = (node) => {
+        const rect = node.getBoundingClientRect();
+        return rect.width >= 160 && rect.height >= 16 && rect.bottom > 0 && rect.top < (window.innerHeight || 900);
+      };
+      const hasAction = (node, text) => actionRe.test(`${text} ${Array.from(node.querySelectorAll("button, a, [role='button']")).slice(0, 8).map(textOf).join(" ")}`);
+      const shouldHide = (node) => {
+        if (!(node instanceof HTMLElement) || node.closest("[data-message-author-role], article")) return false;
+        if (!node.matches(quotaSurfaceSelector) || !visibleBox(node)) return false;
+        if (node.querySelector("input, textarea, [contenteditable='true'], [role='textbox']")) return false;
+        const text = textOf(node);
+        if (text.length < 12 || text.length > (node.matches(quotaDialogSelector) ? 4_000 : 500)) return false;
+        const rect = node.getBoundingClientRect();
+        const bannerLike = rect.width >= 300 && rect.height >= 30 && rect.height <= 240 && quotaRe.test(text) && resetRe.test(text);
+        const cardLike = rect.width >= 160 && rect.width <= 560 && rect.height >= 70 && rect.height <= 340 && usageCardRe.test(text) && hasAction(node, text);
+        const dialogLike = node.matches(quotaDialogSelector) && quotaRe.test(text) && (resetRe.test(text) || actionRe.test(text));
+        return (bannerLike || cardLike || dialogLike) && (hasAction(node, text) || dialogLike);
+      };
+      const findHideTarget = (node) => {
+        const viewportWidth = window.innerWidth || document.documentElement.clientWidth || 1;
+        const viewportHeight = window.innerHeight || document.documentElement.clientHeight || 1;
+        const nodeRect = node.getBoundingClientRect();
+        if (nodeRect.width >= viewportWidth * 0.8 && nodeRect.height >= viewportHeight * 0.8) return node;
+        let current = node;
+        for (let depth = 0; depth < 4; depth += 1) {
+          const parent = current.parentElement;
+          if (!parent || parent === document.body || parent === document.documentElement) break;
+          const protectedContent = parent.querySelector("[data-message-author-role], article, input, textarea, [contenteditable='true'], [role='textbox']");
+          const compactSurface = textOf(parent).length <= 800 && !protectedContent;
+          const rect = parent.getBoundingClientRect();
+          const position = window.getComputedStyle(parent).position;
+          const coversViewport = rect.width >= viewportWidth * 0.8 && rect.height >= viewportHeight * 0.8;
+          const portalLike = parent.matches("[data-radix-portal], [data-portal], [class*='portal' i]") || Boolean(parent.querySelector("[data-radix-dialog-overlay], [data-slot='dialog-overlay'], [class*='backdrop' i], [class*='overlay' i]"));
+          if (compactSurface && (portalLike || (coversViewport && (position === "fixed" || position === "absolute")))) return parent;
+          current = parent;
+        }
+        return node;
+      };
+      if (!document.documentElement) return 0;
+      let style = document.getElementById(STYLE_ID);
+      if (!style) {
+        style = document.createElement("style");
+        style.id = STYLE_ID;
+        style.textContent = `[${HIDDEN_ATTR}="true"] { display: none !important; visibility: hidden !important; pointer-events: none !important; }`;
+        document.documentElement.appendChild(style);
+      }
+      const scan = () => {
+        let hiddenCount = 0;
+        for (const node of document.body?.querySelectorAll(quotaSurfaceSelector) || []) {
+          if (!node.hasAttribute(HIDDEN_ATTR) && shouldHide(node)) {
+            findHideTarget(node).setAttribute(HIDDEN_ATTR, "true");
+            hiddenCount += 1;
+          }
+        }
+        return hiddenCount;
+      };
+      if (!state.observer) {
+        state.observer = new MutationObserver(() => {
+          if (!state.timer) state.timer = window.setTimeout(() => { state.timer = 0; scan(); }, 80);
+        });
+        state.observer.observe(document.documentElement, { childList: true, subtree: true, characterData: true });
+      }
+      return scan();
+    };
+    const cleanupGuestUsage = () => {
+      const HIDDEN_ATTR = "data-codex-plus-hidden-usage-alert";
+      const state = window.__codexPlusUsageAlertGuestState;
+      if (state?.timer) window.clearTimeout(state.timer);
+      state?.observer?.disconnect();
+      delete window.__codexPlusUsageAlertGuestState;
+      document.querySelectorAll(`[${HIDDEN_ATTR}="true"]`).forEach((node) => node.removeAttribute(HIDDEN_ATTR));
+      document.getElementById("codex-plus-hide-usage-alert-style")?.remove();
+    };
+    const scanGuests = () => {
+      for (const guest of document.querySelectorAll("webview")) {
+        if (typeof guest.executeJavaScript !== "function" || guestPending.has(guest)) continue;
+        guestPending.add(guest);
+        try {
+          Promise.resolve(guest.executeJavaScript(`(${scanGuestUsage.toString()})()`, true)).catch(() => {}).finally(() => guestPending.delete(guest));
+        } catch {
+          guestPending.delete(guest);
+        }
+      }
+    };
+    const attachGuest = (guest) => {
+      if (guestListeners.has(guest)) return;
+      const onGuestReady = () => window.setTimeout(scanGuests, 80);
+      guest.addEventListener("dom-ready", onGuestReady);
+      guest.addEventListener("did-stop-loading", onGuestReady);
+      guestListeners.set(guest, onGuestReady);
     };
     const hide = (node) => {
       if (!(node instanceof HTMLElement) || node === document.body || node === document.documentElement) return;
-      node.setAttribute(HIDDEN_ATTR, "true");
-      hidden.add(node);
+      const target = findHideTarget(node);
+      target.setAttribute(HIDDEN_ATTR, "true");
+      hidden.add(target);
     };
     const scan = () => {
       timer = 0;
       if (!document.body) return;
-      for (const node of document.body.querySelectorAll('[role="alert"], [role="status"], [aria-live]')) {
+      for (const node of document.body.querySelectorAll(quotaSurfaceSelector)) {
         if (!node.hasAttribute(HIDDEN_ATTR) && shouldHide(node)) hide(node);
       }
+      for (const guest of document.querySelectorAll("webview")) attachGuest(guest);
+      scanGuests();
     };
     const schedule = () => {
       if (!timer) timer = window.setTimeout(scan, 80);
@@ -1288,6 +1460,12 @@ const FEATURES = {
     return () => {
       if (timer) window.clearTimeout(timer);
       observer?.disconnect();
+      for (const [guest, listener] of guestListeners) {
+        guest.removeEventListener("dom-ready", listener);
+        guest.removeEventListener("did-stop-loading", listener);
+        if (typeof guest.executeJavaScript === "function") guest.executeJavaScript(`(${cleanupGuestUsage.toString()})()`, true).catch(() => {});
+      }
+      guestListeners.clear();
       for (const node of hidden) node.removeAttribute(HIDDEN_ATTR);
       style.remove();
       hidden.clear();

@@ -26,7 +26,7 @@ Bennett UI Improvements 是适用于 [BigPizzaV3 Codex++](https://github.com/Big
 | 历史会话 | 将 Codex 原生近期会话查询上限由默认 50 条提高到可配置的 1–2000 条，不接管会话管理。 |
 | Markdown | KaTeX 公式、数学表格、图片、相对图片路径和公式源码查看。 |
 | 设置 | 独立 Bennett UI 设置页，集中管理功能开关和会话加载数量。 |
-| 降低干扰 | 隐藏额度耗尽及 Plus/Pro 推广提示，同时保留输入框和 Codex 软件更新提示。 |
+| 降低干扰 | 隐藏 Codex 额度提示和 Plus/Pro 推广界面，同时保留输入框和 Codex 软件更新提示。采用事件驱动观察，不使用定时轮询。 |
 
 ## 安装
 
@@ -89,6 +89,12 @@ Bennett UI 从 1.2.1 起已经内置原生会话加载器，**不需要**再单�
 - 只有真实收到 Credit 数据时才显示点数。
 - API 或纯 API provider 显示 `API`，不会伪造 ChatGPT 官方额度。
 - `market-hide-usage-alert.js` 的功能已经内置，不再需要单独安装。
+
+## 额度提示过滤
+
+- 过滤器只针对 Codex 已知的额度提示 aside（`aside:has(h3):has(button)`）和套餐 dialog，并在确认额度、重置和升级文本后才隐藏。
+- 主页面使用已有的 DOM 变更观察器；嵌入式 ChatGPT webview 在加载完成或导航时安装一次作用域内观察器，后续新增提示由它自己处理，不依赖定时器。
+- 不会扫描所有文本节点，不会每 1.5 秒轮询，也不会触碰会话正文、输入框或 Codex 软件更新提示。
 
 ## Markdown 预览增强
 

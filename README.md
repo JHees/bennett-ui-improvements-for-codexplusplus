@@ -26,7 +26,7 @@ This project adapts [b-nnett/codex-plusplus-bennett-ui](https://github.com/b-nne
 | History | Raise Codex's native recent-history query limit from 50 to a configurable 1–2000 without taking over conversation management. |
 | Markdown | KaTeX formulas, math tables, images, relative image paths, and source inspection in `.md` previews. |
 | Settings | A dedicated Bennett UI panel with per-feature switches and a native-history load control. |
-| Noise reduction | Hides quota-exhaustion and Plus/Pro upsell surfaces while preserving the composer and app-update notices. |
+| Noise reduction | Hides the Codex quota aside and Plus/Pro upsell surfaces while preserving the composer and app-update notices. Uses event-driven observers without periodic polling. |
 
 ## Install
 
@@ -89,6 +89,12 @@ When CC Switch unified session history is enabled, CC Switch/Codex still own the
 - Credit appears only when actual credit data is available.
 - API or pure-API providers show `API`; Bennett does not fabricate ChatGPT quota values.
 - The standalone `market-hide-usage-alert.js` script is no longer needed because that behavior is built in.
+
+## Quota-prompt filtering
+
+- The filter targets Codex's known quota-exhaustion aside (`aside:has(h3):has(button)`) and pricing dialog surfaces, then confirms quota, reset, and upgrade text before hiding them.
+- The main page uses its existing DOM mutation observer. Embedded ChatGPT webviews receive one scoped observer when they become ready or navigate, so later prompt insertion is handled without a timer.
+- The filter does not scan every text node, poll every 1.5 seconds, or touch conversation articles, the composer, or Codex update notices.
 
 ## Markdown preview
 
