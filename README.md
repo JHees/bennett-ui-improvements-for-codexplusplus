@@ -4,7 +4,7 @@
 
 **A focused UI and workflow upgrade for BigPizzaV3 Codex++.**
 
-[![Version](https://img.shields.io/badge/version-1.2.4-14b8a6)](https://github.com/JHees/bennett-ui-improvements-for-codexplusplus)
+[![Version](https://img.shields.io/badge/version-1.2.5-14b8a6)](https://github.com/JHees/bennett-ui-improvements-for-codexplusplus)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Runtime](https://img.shields.io/badge/runtime-Codex%2B%2B-111827)](https://github.com/BigPizzaV3/CodexPlusPlus)
 [![Mode](https://img.shields.io/badge/mode-renderer--only-7c3aed)](#compatibility)
@@ -21,7 +21,7 @@ This project adapts [b-nnett/codex-plusplus-bennett-ui](https://github.com/b-nne
 
 | Area | What it adds |
 | --- | --- |
-| Sidebar | Project colors and backgrounds, compact action grid, optional square corners, and slash-menu polish. |
+| Sidebar | Project and conversation colors, compact action grid, optional square corners, and slash-menu polish. |
 | Usage | Real 5-hour and weekly quota data, optional Credit view, reset-time tooltips, and explicit `API` mode. |
 | History | Raise Codex's native recent-history query limit from 50 to a configurable 1–2000 without taking over conversation management. |
 | Markdown | KaTeX formulas, math tables, images, relative image paths, and source inspection in `.md` previews. |
@@ -53,6 +53,7 @@ Enable the script in Codex++ and reload user scripts. A full Codex restart is no
 | Feature | Default | Support |
 | --- | ---: | --- |
 | Project backgrounds and colors | On | Stable |
+| Conversation project colors | On | Stable for assigned project conversations; ordinary chats keep the default style |
 | 5-hour / Weekly / Credit usage | On | Stable when the current page exposes usage data |
 | Hide quota-exhaustion prompts | On | Stable |
 | Hide Plus/Pro upgrade prompts | On | Stable; Codex app-update notices remain visible |
@@ -65,6 +66,14 @@ Enable the script in Codex++ and reload user scripts. A full Codex restart is no
 | Square sidebar corners | Off | Stable |
 
 Feature switches and the history loader are available under **Codex++ Management Tools → Bennett UI Settings**. Preferences are stored locally and survive script reloads.
+
+## Conversation project colors
+
+- Conversation rows inherit the color of their project in the normal sidebar, expanded project lists, and limited-filter results.
+- The display uses a subtle background and a colored leading edge so titles, selected rows, and unread indicators remain easy to read.
+- Conversations without a known project keep Codex's default appearance.
+- Turn the feature on or off from **Codex++ Management Tools → Bennett UI Settings**. Project color choices continue to apply automatically.
+- Changing a project color updates currently visible conversation rows immediately.
 
 ## Native history query limit
 

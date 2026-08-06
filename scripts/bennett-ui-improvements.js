@@ -21,7 +21,7 @@
   "use strict";
 
   const INSTALL_KEY = "__bennettUiImprovementsBigPizza";
-  const VERSION = "1.2.4";
+  const VERSION = "1.2.5";
   const HISTORY_TARGET_STORAGE_KEY = "__codexListPagebusterTarget";
   const HISTORY_TARGET_DEFAULT = 500;
   const HISTORY_TARGET_MIN = 1;
@@ -97,6 +97,8 @@
  *                          grid of filled buttons.
  *  • sidebar-project-backgrounds  Add subtle grouped backgrounds behind
  *                                 project rows in the main sidebar.
+ *  • sidebar-conversation-colors Color conversation rows by their native
+ *                                 project association.
  *  • slash-menu-polish  Tightens the composer slash menu with denser rows,
  *                       clearer active state, and calmer section headers.
  *
@@ -128,6 +130,7 @@ module.exports = {
         "match-sidebar-width": true,
         "sidebar-action-grid": true,
         "sidebar-project-backgrounds": true,
+        "sidebar-conversation-colors": true,
         "render-markdown-preview-math": true,
         "slash-menu-polish": true,
         "hide-usage-alert": true,
@@ -255,83 +258,6 @@ function renderSettings(root, state) {
   }
   section.appendChild(card);
   root.appendChild(section);
-}
-
-/**
- * Heuristic sidebar finder. Codex's left rail is typically a flex column
- * pinned to x=0 with substantial height. We rank candidates by:
- *   • bounding-rect.left near 0
- *   • height > 60% of viewport
- *   • narrow-ish width (< 360px) for collapsed/expanded sidebars
- *   • presence of `nav` or aria-label="Primary"
- * and pick the best. Returns the chosen element + a few selector hints.
- *
- * Currently unused — kept around for ad-hoc DOM debugging during tweak
- * development. Wire it up to a temporary button if needed.
- */
-// eslint-disable-next-line no-unused-vars
-async function dumpSidebar(api) {
-  const candidates = [];
-  const all = document.querySelectorAll(
-    'aside, nav, [role="navigation"], [data-testid*="sidebar" i], div',
-  );
-  const vh = window.innerHeight;
-  for (const el of all) {
-    const r = el.getBoundingClientRect();
-    if (r.left > 8) continue;
-    if (r.height < vh * 0.6) continue;
-    if (r.width < 40 || r.width > 420) continue;
-    let score = 0;
-    if (el.tagName === "ASIDE" || el.tagName === "NAV") score += 5;
-    if (el.getAttribute("role") === "navigation") score += 3;
-    if (el.querySelector("nav")) score += 1;
-    if (/sidebar/i.test(el.getAttribute("data-testid") || "")) score += 4;
-    if (/rounded/.test(el.className || "")) score += 2;
-    score += Math.max(0, 200 - r.width) / 100; // prefer narrower
-    candidates.push({ el, score, rect: r });
-  }
-  candidates.sort((a, b) => b.score - a.score);
-  const top = candidates[0];
-  if (!top) return { ok: false, reason: "no candidate" };
-
-  const html = top.el.outerHTML;
-  const summary = candidates.slice(0, 5).map((c) => ({
-    tag: c.el.tagName.toLowerCase(),
-    classes: c.el.className,
-    rect: {
-      x: Math.round(c.rect.left),
-      y: Math.round(c.rect.top),
-      w: Math.round(c.rect.width),
-      h: Math.round(c.rect.height),
-    },
-    score: c.score,
-  }));
-
-  const payload =
-    `<!-- top candidates (best first) -->\n` +
-    summary.map((s) => "<!-- " + JSON.stringify(s) + " -->").join("\n") +
-    `\n\n<!-- chosen element outerHTML -->\n` +
-    html;
-
-  let wrotePath = null;
-  try {
-    if (typeof api.fs?.write === "function") {
-      await api.fs.write("sidebar-dump.html", payload);
-      wrotePath = "sidebar-dump.html (in tweak data dir)";
-    }
-  } catch (e) {
-    api.log.warn("fs.write failed", e);
-  }
-
-  let copied = false;
-  try {
-    await navigator.clipboard.writeText(payload);
-    copied = true;
-  } catch (e) {
-    api.log.warn("clipboard write failed", e);
-  }
-
-  return { ok: true, copied, wrotePath, summary };
 }
 
 function featureRow(state, f) {
@@ -7459,6 +7385,7 @@ const FEATURES = {
         textValue: "var(--codexpp-project-gray-text)",
       },
     ];
+    window.__codexppSidebarProjectPalette = PALETTE;
     const colorPrefsCacheKey = "__codexppSidebarProjectColorPrefs";
     let colorPrefs = readColorPrefs();
     window[colorPrefsCacheKey] = colorPrefs;
@@ -7744,7 +7671,9 @@ const FEATURES = {
     const writeColorPrefs = () => {
       colorPrefs = { ...colorPrefs };
       window[colorPrefsCacheKey] = colorPrefs;
-      return api.storage.set(COLOR_STORAGE_KEY, colorPrefs);
+      const result = api.storage.set(COLOR_STORAGE_KEY, colorPrefs);
+      window.dispatchEvent(new CustomEvent("codexpp-sidebar-project-colors-changed"));
+      return result;
     };
 
     const isExpandedProject = (row) => {
@@ -8292,6 +8221,312 @@ const FEATURES = {
     };
   },
 
+  /**
+   * Apply the selected project color to native conversation rows.
+   * Codex owns the list, ordering, and filtering; this feature only adds
+   * reversible visual marks to rows carrying the native sidebar attributes.
+   */
+  "sidebar-conversation-colors"(api) {
+    const STYLE_ID = "codexpp-sidebar-conversation-colors";
+    const ATTR = "data-codexpp-sidebar-conversation-color";
+    const COLOR_STORAGE_KEY = "sidebar-project-backgrounds:colors";
+    const COLOR_EVENT = "codexpp-sidebar-project-colors-changed";
+    const PALETTE_CACHE_KEY = "__codexppSidebarProjectPalette";
+    const COLOR_PREFS_CACHE_KEY = "__codexppSidebarProjectColorPrefs";
+    const ASIDE_SELECTOR = [
+      "aside.pointer-events-auto.relative.flex.overflow-hidden",
+      "aside.pointer-events-auto.relative.flex.overflow-visible",
+      "aside.pointer-events-auto.relative.flex",
+    ].join(", ");
+    const THREAD_SELECTOR = "[data-app-action-sidebar-thread-row]";
+    const PROJECT_SELECTOR = "[data-app-action-sidebar-project-row]";
+    const PROJECT_LIST_SELECTOR = "[data-app-action-sidebar-project-list-id]";
+    const PROJECT_ID_ATTRS = [
+      "data-app-action-sidebar-project-id",
+      "data-project-id",
+    ];
+    const PROJECT_LABEL_ATTRS = [
+      "data-app-action-sidebar-project-label",
+      "data-project-name",
+    ];
+    const PALETTE_FALLBACK = [
+      {
+        id: "blue",
+        value: "var(--color-token-charts-blue, var(--color-token-text-link-foreground))",
+      },
+      {
+        id: "green",
+        value: "var(--color-token-charts-green, var(--color-token-text-secondary))",
+      },
+      {
+        id: "yellow",
+        value: "var(--color-token-charts-yellow, var(--color-token-text-secondary))",
+      },
+      {
+        id: "red",
+        value: "var(--color-token-charts-red, var(--color-token-text-secondary))",
+      },
+      {
+        id: "pink",
+        value: "var(--pink-400, var(--color-token-charts-purple, var(--color-token-text-link-foreground)))",
+      },
+      {
+        id: "purple",
+        value: "var(--color-token-charts-purple, var(--color-token-text-link-foreground))",
+      },
+      {
+        id: "gray",
+        value: "var(--color-token-text-secondary)",
+      },
+    ];
+    let disposed = false;
+    let activeSidebar = null;
+    let applyTimer = 0;
+    let colorEventHandler = null;
+    let colorPrefs = {};
+
+    document.getElementById(STYLE_ID)?.remove();
+    const style = document.createElement("style");
+    style.id = STYLE_ID;
+    style.textContent = `
+      [${ATTR}="row"] {
+        position: relative !important;
+        box-sizing: border-box !important;
+        border-inline-start: 3px solid color-mix(
+          in srgb,
+          var(--codexpp-project-tint, var(--color-token-text-secondary)) 78%,
+          transparent
+        ) !important;
+        background-color: color-mix(
+          in srgb,
+          var(--codexpp-project-tint, var(--color-token-text-secondary)) 6%,
+          transparent
+        ) !important;
+      }
+
+      [${ATTR}="row"]:hover {
+        background-color: color-mix(
+          in srgb,
+          var(--codexpp-project-tint, var(--color-token-text-secondary)) 10%,
+          transparent
+        ) !important;
+      }
+
+      [${ATTR}="row"][aria-selected="true"],
+      [${ATTR}="row"][data-app-action-sidebar-thread-active="true"] {
+        background-color: color-mix(
+          in srgb,
+          var(--codexpp-project-tint, var(--color-token-text-secondary)) 14%,
+          var(--color-token-list-hover-background, transparent)
+        ) !important;
+      }
+    `;
+    document.head.appendChild(style);
+
+    const normalize = (value) =>
+      String(value || "").replace(/\s+/g, " ").trim().toLowerCase();
+
+    const visible = (node) => {
+      if (!(node instanceof HTMLElement) || !node.isConnected) return false;
+      if (node.closest("[hidden], [inert], [aria-hidden='true']")) return false;
+      const computed = window.getComputedStyle(node);
+      if (computed.display === "none" || computed.visibility === "hidden" || computed.opacity === "0") return false;
+      const rect = node.getBoundingClientRect();
+      return rect.width > 0 && rect.height > 0;
+    };
+
+    const mainSidebar = () => {
+      const aside = document.querySelector(ASIDE_SELECTOR);
+      return aside instanceof HTMLElement ? aside : null;
+    };
+
+    const attrValue = (node, names) => {
+      for (const name of names) {
+        const value = node?.getAttribute?.(name);
+        if (value) return value.trim();
+      }
+      return "";
+    };
+
+    const projectInfo = (node) => {
+      if (!(node instanceof HTMLElement)) return null;
+      const id = attrValue(node, PROJECT_ID_ATTRS);
+      const label = attrValue(node, PROJECT_LABEL_ATTRS) ||
+        normalize(
+          node.getAttribute("aria-label") ||
+          node.getAttribute("title") ||
+          node.querySelector("[role='button'][aria-label]")?.getAttribute("aria-label") ||
+          "",
+        );
+      if (!id && !label) return null;
+      return {
+        id,
+        label,
+        key: id ? `id:${normalize(id)}` : `label:${normalize(label)}`,
+      };
+    };
+
+    const projectIndex = (sidebar) => {
+      const byId = new Map();
+      const byList = new Map();
+      for (const row of sidebar.querySelectorAll(PROJECT_SELECTOR)) {
+        const info = projectInfo(row);
+        if (!info) continue;
+        if (info.id) byId.set(normalize(info.id), info);
+        const list = row.querySelector(PROJECT_LIST_SELECTOR);
+        const listId = attrValue(list, ["data-app-action-sidebar-project-list-id"]);
+        if (listId) byList.set(normalize(listId), info);
+      }
+      for (const list of sidebar.querySelectorAll(PROJECT_LIST_SELECTOR)) {
+        const listId = attrValue(list, ["data-app-action-sidebar-project-list-id"]);
+        if (!listId || byList.has(normalize(listId))) continue;
+        const row = list.closest(PROJECT_SELECTOR);
+        const info = projectInfo(row);
+        if (info) byList.set(normalize(listId), info);
+      }
+      return { byId, byList };
+    };
+
+    const secondaryProjectInfo = (thread) => {
+      const secondary = Array.from(
+        thread.querySelectorAll('[data-thread-secondary-title="true"]'),
+      ).find((node) => {
+        const icon = node.querySelector("svg");
+        const viewBox = icon?.getAttribute("viewBox") || "";
+        const width = icon?.getAttribute("width") || "";
+        return viewBox === "0 0 16 16" || width === "16";
+      });
+      const label = normalize(secondary?.textContent || "");
+      return label
+        ? { id: "", label, key: `label:${label}` }
+        : null;
+    };
+
+    const projectForThread = (thread, index) => {
+      const nestedProject = thread.closest(PROJECT_SELECTOR);
+      const nestedInfo = projectInfo(nestedProject);
+      if (nestedInfo) return nestedInfo;
+
+      const directId = attrValue(thread, PROJECT_ID_ATTRS);
+      if (directId) return index.byId.get(normalize(directId)) || { id: directId, label: "", key: `id:${normalize(directId)}` };
+
+      const list = thread.closest(PROJECT_LIST_SELECTOR);
+      const listId = attrValue(list, ["data-app-action-sidebar-project-list-id"]);
+      if (listId) return index.byList.get(normalize(listId)) || null;
+
+      const directLabel = attrValue(thread, PROJECT_LABEL_ATTRS);
+      if (directLabel) {
+        const label = normalize(directLabel);
+        return { id: "", label, key: `label:${label}` };
+      }
+
+      // Newer Codex builds render the project as a folder-marked secondary
+      // title inside each thread row instead of exposing project row nodes.
+      return secondaryProjectInfo(thread);
+    };
+
+    const readColorPrefs = () => {
+      const stored = api.storage.get(COLOR_STORAGE_KEY, {});
+      const cache = window[COLOR_PREFS_CACHE_KEY];
+      return {
+        ...(stored && typeof stored === "object" && !Array.isArray(stored) ? stored : {}),
+        ...(cache && typeof cache === "object" && !Array.isArray(cache) ? cache : {}),
+      };
+    };
+
+    colorPrefs = readColorPrefs();
+
+    const paletteFor = (info) => {
+      const palette = Array.isArray(window[PALETTE_CACHE_KEY]) && window[PALETTE_CACHE_KEY].length
+        ? window[PALETTE_CACHE_KEY]
+        : PALETTE_FALLBACK;
+      const storedId = colorPrefs[normalize(info.label)] || (info.id && colorPrefs[`id:${normalize(info.id)}`]);
+      const selected = palette.find((item) => item.id === storedId);
+      if (selected) return selected;
+      const seed = normalize(info.label || info.id);
+      let hash = 0;
+      for (let i = 0; i < seed.length; i += 1) hash = (hash * 31 + seed.charCodeAt(i)) >>> 0;
+      return palette[hash % Math.min(4, palette.length)];
+    };
+
+    const clearRow = (row) => {
+      row.removeAttribute(ATTR);
+      row.style.removeProperty("--codexpp-project-tint");
+    };
+
+    const apply = () => {
+      if (disposed) return;
+      const sidebar = mainSidebar();
+      activeSidebar = sidebar;
+      if (!sidebar) return;
+      const index = projectIndex(sidebar);
+      const active = new Set();
+      for (const thread of sidebar.querySelectorAll(THREAD_SELECTOR)) {
+        if (!(thread instanceof HTMLElement) || !visible(thread)) continue;
+        const info = projectForThread(thread, index);
+        if (!info) {
+          clearRow(thread);
+          continue;
+        }
+        const palette = paletteFor(info);
+        thread.setAttribute(ATTR, "row");
+        thread.style.setProperty("--codexpp-project-tint", palette.value);
+        active.add(thread);
+      }
+      sidebar.querySelectorAll(`[${ATTR}="row"]`).forEach((row) => {
+        if (row instanceof HTMLElement && !active.has(row)) clearRow(row);
+      });
+    };
+
+    const scheduleApply = (delay = 100) => {
+      if (disposed) return;
+      if (applyTimer) window.clearTimeout(applyTimer);
+      applyTimer = window.setTimeout(() => {
+        applyTimer = 0;
+        apply();
+      }, delay);
+    };
+
+    const observer = new MutationObserver((records) => {
+      const sidebar = activeSidebar?.isConnected ? activeSidebar : mainSidebar();
+      if (!sidebar) return scheduleApply();
+      const relevant = records.some((record) => {
+        const target = record.target instanceof Element ? record.target : record.target?.parentElement;
+        if (target instanceof Element && (target === sidebar || sidebar.contains(target))) return true;
+        return [...record.addedNodes, ...record.removedNodes].some((node) =>
+          node instanceof Element && (node.matches?.(ASIDE_SELECTOR) || node.querySelector?.(THREAD_SELECTOR) || node.querySelector?.(PROJECT_SELECTOR)),
+        );
+      });
+      if (relevant) scheduleApply();
+    });
+
+    colorEventHandler = () => {
+      colorPrefs = readColorPrefs();
+      scheduleApply(0);
+    };
+    window.addEventListener(COLOR_EVENT, colorEventHandler);
+    apply();
+    observer.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: [
+      "aria-selected",
+      "data-app-action-sidebar-project-id",
+      "data-app-action-sidebar-project-label",
+      "data-app-action-sidebar-project-list-id",
+      "data-app-action-sidebar-thread-active",
+      "data-app-action-sidebar-thread-row",
+    ] });
+
+    return () => {
+      disposed = true;
+      observer.disconnect();
+      if (applyTimer) window.clearTimeout(applyTimer);
+      if (colorEventHandler) window.removeEventListener(COLOR_EVENT, colorEventHandler);
+      activeSidebar?.querySelectorAll(`[${ATTR}="row"]`).forEach((row) => {
+        if (row instanceof HTMLElement) clearRow(row);
+      });
+      style.remove();
+    };
+  },
+
 };
 
 // ─────────────────────────────────────────────────────────────── helpers ──
@@ -8781,6 +9016,7 @@ function switchControl(initial, onChange) {
     "match-sidebar-width",
     "sidebar-action-grid",
     "sidebar-project-backgrounds",
+    "sidebar-conversation-colors",
     "render-markdown-preview-math",
     "slash-menu-polish",
     "hide-usage-alert",
@@ -8839,6 +9075,13 @@ function switchControl(initial, onChange) {
       id: "sidebar-project-backgrounds",
       title: "项目背景和颜色",
       detail: "为项目行增加分组背景，并保留旧的项目颜色偏好。",
+      defaultEnabled: true,
+      status: "可用",
+    },
+    {
+      id: "sidebar-conversation-colors",
+      title: "会话项目着色",
+      detail: "让会话行继承所属项目的颜色；无法识别项目的会话保持默认样式。",
       defaultEnabled: true,
       status: "可用",
     },
@@ -8954,7 +9197,7 @@ function switchControl(initial, onChange) {
       <div class="codex-plus-row bennett-ui-settings-head">
         <div>
           <div class="codex-plus-row-title">Bennett UI Improvements ${escapeHtmlLocal(VERSION)}</div>
-          <div class="codex-plus-row-description">项目侧栏、额度显示、Markdown 预览与原生会话查询上限设置。</div>
+          <div class="codex-plus-row-description">项目和会话侧栏、额度显示、Markdown 预览与原生会话查询上限设置。</div>
         </div>
       </div>
       ${featureInfo.map((item) => `
