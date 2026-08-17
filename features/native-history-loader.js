@@ -149,14 +149,22 @@
       if (checked.has(key)) continue;
       checked.add(key);
       const value = mod?.[key];
-      if (typeof value !== "function") continue;
+      if (typeof value !== "function" || isClassConstructor(value)) continue;
       try {
         if (/sendRequest\s*\(/.test(Function.prototype.toString.call(value))) {
-          return value;
+          return value.bind(mod);
         }
       } catch {}
     }
     return null;
+  }
+
+  function isClassConstructor(value) {
+    try {
+      return /^\s*class\s/.test(Function.prototype.toString.call(value));
+    } catch {
+      return false;
+    }
   }
 
   async function loadInternalActionModule() {
