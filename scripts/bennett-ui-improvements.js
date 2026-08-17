@@ -8402,6 +8402,39 @@ const FEATURES = {
         : null;
     };
 
+    const reactProjectInfo = (thread) => {
+      const fiberKey = Object.getOwnPropertyNames(thread).find((name) =>
+        name.startsWith("__reactFiber$"),
+      );
+      let fiber = fiberKey ? thread[fiberKey] : null;
+      const visited = new Set();
+
+      // Priority and recent views no longer expose project attributes in the
+      // DOM, but the native hover-card props still carry the same association.
+      for (let depth = 0; fiber && depth < 12 && !visited.has(fiber); depth += 1) {
+        visited.add(fiber);
+        for (const props of [fiber.memoizedProps, fiber.pendingProps]) {
+          if (!props || typeof props !== "object") continue;
+          if (props.isProjectlessHoverCard === true) return false;
+          const id = typeof props.hoverCardProjectId === "string"
+            ? props.hoverCardProjectId.trim()
+            : "";
+          const label = typeof props.hoverCardProjectLabel === "string"
+            ? props.hoverCardProjectLabel.trim()
+            : "";
+          if (id || label) {
+            return {
+              id,
+              label,
+              key: id ? `id:${normalize(id)}` : `label:${normalize(label)}`,
+            };
+          }
+        }
+        fiber = fiber.return;
+      }
+      return null;
+    };
+
     const projectForThread = (thread, index) => {
       const nestedProject = thread.closest(PROJECT_SELECTOR);
       const nestedInfo = projectInfo(nestedProject);
@@ -8419,6 +8452,10 @@ const FEATURES = {
         const label = normalize(directLabel);
         return { id: "", label, key: `label:${label}` };
       }
+
+      const reactInfo = reactProjectInfo(thread);
+      if (reactInfo === false) return null;
+      if (reactInfo) return reactInfo;
 
       // Newer Codex builds render the project as a folder-marked secondary
       // title inside each thread row instead of exposing project row nodes.
