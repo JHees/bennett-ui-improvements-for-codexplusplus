@@ -3331,6 +3331,16 @@ const FEATURES = {
       return /\bsettings?\b|preferences?|设置|偏好/.test(text);
     };
 
+    const isProfileButton = (button) => {
+      const text = controlText(button);
+      return /\bprofile\b|\baccount\b|个人资料|账户|账号/.test(text);
+    };
+
+    const isBottomUtilityButton = (button) => {
+      const text = controlText(button);
+      return /\bvoice\b|\bhelp\b|语音|帮助/.test(text);
+    };
+
     const isNearSidebarBottom = (sidebar, node) => {
       if (!(sidebar instanceof HTMLElement) || !(node instanceof HTMLElement)) return false;
       const sidebarRect = sidebar.getBoundingClientRect();
@@ -3347,20 +3357,60 @@ const FEATURES = {
       );
     };
 
-    const isCompactIconControl = (control) => {
-      const rect = control.getBoundingClientRect();
-      const text = controlText(control);
-      return rect.width > 0 && rect.width <= 56 && rect.height > 0 && rect.height <= 56 && text.length <= 32;
-    };
-
     const isUsageControlNode = (node) =>
       node.closest?.('[data-codexpp="usage-slot"], [data-codexpp="usage-box"], [data-codexpp="usage-boxes"]');
 
+    const isSidebarContentRow = (node) => Boolean(
+      node?.closest?.(
+        '[data-app-action-sidebar-thread-row], ' +
+        '[data-app-action-sidebar-project-row], ' +
+        '[data-app-action-sidebar-project-list-id], ' +
+        '[role="listitem"]',
+      ),
+    );
+
+    const isBottomToolbarRow = (sidebar, row) => {
+      if (
+        !(sidebar instanceof HTMLElement) ||
+        !(row instanceof HTMLElement) ||
+        isSidebarContentRow(row)
+      ) {
+        return false;
+      }
+      const sidebarRect = sidebar.getBoundingClientRect();
+      const rect = row.getBoundingClientRect();
+      const style = window.getComputedStyle(row);
+      if (
+        style.display !== "flex" ||
+        rect.width < sidebarRect.width * 0.75 ||
+        rect.height < 36 ||
+        rect.height > 80 ||
+        rect.bottom < sidebarRect.bottom - 20 ||
+        rect.bottom > sidebarRect.bottom + 8
+      ) {
+        return false;
+      }
+      const controls = Array.from(row.querySelectorAll('button, a, [role="button"]'))
+        .filter((control) => control instanceof HTMLElement && !isUsageControlNode(control));
+      return controls.some(isProfileButton) && controls.some(isBottomUtilityButton);
+    };
+
+    const nearestBottomToolbar = (sidebar, control) => {
+      let row = control;
+      while (row && row !== document.body && row !== sidebar.parentElement) {
+        if (isBottomToolbarRow(sidebar, row)) return row;
+        row = row.parentElement;
+      }
+      return null;
+    };
+
     const nearestControlRow = (sidebar, button) => {
+      if (isSidebarContentRow(button)) return null;
       const sidebarRect = sidebar.getBoundingClientRect();
       let row = button.parentElement;
       while (row && row !== document.body && row !== sidebar.parentElement) {
         if (!(row instanceof HTMLElement)) break;
+        if (isSidebarContentRow(row)) return null;
         const rect = row.getBoundingClientRect();
         const style = window.getComputedStyle(row);
         const buttonCount = row.querySelectorAll('button, a, [role="button"]').length;
@@ -3403,12 +3453,12 @@ const FEATURES = {
       return null;
     };
 
-    const createInlineSlot = (row, anchor) => {
+    const createInlineSlot = (row, anchor, mode = "controls-inline") => {
       const existing = row.querySelector(':scope > [data-codexpp="usage-slot"]');
       if (existing instanceof HTMLElement) return existing;
       const slot = document.createElement("div");
       slot.dataset.codexpp = "usage-slot";
-      slot.dataset.codexppUsageSlot = "controls-inline";
+      slot.dataset.codexppUsageSlot = mode;
       slot.className = "flex shrink-0 items-center";
       if (anchor?.parentElement === row) {
         row.insertBefore(slot, anchor.nextSibling);
@@ -3432,42 +3482,87 @@ const FEATURES = {
       return slot;
     };
 
+    const createBottomToolbarSlot = (toolbar) => {
+      const existing = toolbar.querySelector(':scope > [data-codexpp="usage-slot"]');
+      if (existing instanceof HTMLElement) return existing;
+      const slot = document.createElement("div");
+      slot.dataset.codexpp = "usage-slot";
+      slot.dataset.codexppUsageSlot = "bottom-toolbar-inline";
+      slot.className = "flex shrink-0 items-center";
+      toolbar.appendChild(slot);
+      return slot;
+    };
+
+    const isValidUsageSlot = (sidebar, slot) => {
+      if (
+        !(slot instanceof HTMLElement) ||
+        !(slot.parentElement instanceof HTMLElement) ||
+        !slot.isConnected ||
+        !sidebar.contains(slot)
+      ) {
+        return false;
+      }
+      const mode = slot.dataset.codexppUsageSlot;
+      if (mode === "sidebar-floating-fallback") {
+        return slot.parentElement === sidebar;
+      }
+      const row = slot.parentElement;
+      if (isSidebarContentRow(row) || !isNearSidebarBottom(sidebar, row)) return false;
+      if (mode === "bottom-toolbar-inline") return isBottomToolbarRow(sidebar, row);
+      if (mode === "status-inline") return isDownloadStatusNode(row);
+      if (mode !== "controls-inline") return false;
+      return Array.from(row.querySelectorAll('button, a, [role="button"]')).some(
+        (control) =>
+          control instanceof HTMLElement &&
+          !isUsageControlNode(control) &&
+          !isSidebarContentRow(control) &&
+          (isDeviceButton(control) || isSettingsButton(control)),
+      );
+    };
+
     const findSidebarSlot = () => {
       const sidebar = findUsageSidebar();
       if (!sidebar) return null;
       for (const slot of sidebar.querySelectorAll('[data-codexpp="usage-slot"]')) {
-        if (
-          !(slot instanceof HTMLElement) ||
-          !(slot.parentElement instanceof HTMLElement) ||
-          !slot.isConnected
-        ) {
-          slot.remove();
-        }
+        if (!isValidUsageSlot(sidebar, slot)) slot.remove();
       }
-      const existingSlot = Array.from(sidebar.querySelectorAll('[data-codexpp="usage-slot"]'))
-        .find((slot) =>
-          slot instanceof HTMLElement &&
-          slot.parentElement instanceof HTMLElement &&
-          slot.isConnected,
-        );
-      if (existingSlot instanceof HTMLElement) return existingSlot;
+      const existingSlots = Array.from(
+        sidebar.querySelectorAll('[data-codexpp="usage-slot"]'),
+      ).filter((slot) => isValidUsageSlot(sidebar, slot));
+      const existingInline = existingSlots.find((slot) =>
+        slot.dataset.codexppUsageSlot === "controls-inline" ||
+        slot.dataset.codexppUsageSlot === "status-inline" ||
+        slot.dataset.codexppUsageSlot === "bottom-toolbar-inline",
+      );
+      if (existingInline instanceof HTMLElement) return existingInline;
+      const existingFallback = existingSlots.find(
+        (slot) => slot.dataset.codexppUsageSlot === "sidebar-floating-fallback",
+      );
 
       const controls = Array.from(sidebar.querySelectorAll('button, a, [role="button"]'))
         .filter((button) =>
           button instanceof HTMLElement &&
           isVisibleElement(button) &&
           isNearSidebarBottom(sidebar, button) &&
-          !isUsageControlNode(button),
+          !isUsageControlNode(button) &&
+          !isSidebarContentRow(button),
         );
+      const bottomToolbarControl = controls.find(
+        (control) => isProfileButton(control) || isBottomUtilityButton(control),
+      );
+      const bottomToolbar = bottomToolbarControl
+        ? nearestBottomToolbar(sidebar, bottomToolbarControl)
+        : null;
+      if (bottomToolbar) {
+        existingFallback?.remove();
+        return createBottomToolbarSlot(bottomToolbar);
+      }
       const deviceControls = controls.filter(isDeviceButton);
       const settingsControls = controls.filter(isSettingsButton);
-      const compactControls = controls.filter(isCompactIconControl);
       const preferredControls = deviceControls.length
         ? deviceControls
-        : compactControls.length
-          ? compactControls
-          : settingsControls;
-      const ordered = (preferredControls.length ? preferredControls : controls).sort((a, b) => {
+        : settingsControls;
+      const ordered = preferredControls.sort((a, b) => {
         const ar = a.getBoundingClientRect();
         const br = b.getBoundingClientRect();
         return br.right - ar.right || br.bottom - ar.bottom;
@@ -3475,7 +3570,10 @@ const FEATURES = {
 
       for (const button of ordered) {
         const row = nearestControlRow(sidebar, button);
-        if (row) return createInlineSlot(row, button);
+        if (row) {
+          existingFallback?.remove();
+          return createInlineSlot(row, button);
+        }
       }
 
       const statusAnchors = Array.from(
@@ -3496,9 +3594,13 @@ const FEATURES = {
 
       for (const anchor of statusAnchors) {
         const row = nearestBottomStatusRow(sidebar, anchor);
-        if (row) return createInlineSlot(row, anchor);
+        if (row) {
+          existingFallback?.remove();
+          return createInlineSlot(row, anchor, "status-inline");
+        }
       }
 
+      if (existingFallback instanceof HTMLElement) return existingFallback;
       return createFallbackSlot(sidebar);
     };
 
@@ -7345,37 +7447,37 @@ const FEATURES = {
       {
         id: "blue",
         label: "Blue",
-        value: "var(--color-token-charts-blue, var(--color-token-text-link-foreground))",
+        value: "var(--blue-400, #0285ff)",
         textValue: "var(--codexpp-project-blue-text)",
       },
       {
         id: "green",
         label: "Green",
-        value: "var(--color-token-charts-green, var(--color-token-text-secondary))",
+        value: "var(--green-400, #04b84c)",
         textValue: "var(--codexpp-project-green-text)",
       },
       {
         id: "yellow",
         label: "Yellow",
-        value: "var(--color-token-charts-yellow, var(--color-token-text-secondary))",
+        value: "var(--yellow-400, #ffc300)",
         textValue: "var(--codexpp-project-yellow-text)",
       },
       {
         id: "red",
         label: "Red",
-        value: "var(--color-token-charts-red, var(--color-token-text-secondary))",
+        value: "var(--red-400, #fa423e)",
         textValue: "var(--codexpp-project-red-text)",
       },
       {
         id: "pink",
         label: "Pink",
-        value: "var(--pink-400, var(--color-token-charts-purple, var(--color-token-text-link-foreground)))",
+        value: "var(--pink-400, #ff66ad)",
         textValue: "var(--codexpp-project-pink-text)",
       },
       {
         id: "purple",
         label: "Purple",
-        value: "var(--color-token-charts-purple, var(--color-token-text-link-foreground))",
+        value: "var(--purple-400, #924ff7)",
         textValue: "var(--codexpp-project-purple-text)",
       },
       {
@@ -7398,22 +7500,22 @@ const FEATURES = {
     style.id = STYLE_ID;
     style.textContent = `
       :root {
-        --codexpp-project-blue-text: var(--color-token-charts-blue, var(--color-token-text-link-foreground));
-        --codexpp-project-green-text: color-mix(in srgb, var(--color-token-charts-green, currentColor) 72%, black);
-        --codexpp-project-yellow-text: color-mix(in srgb, var(--color-token-charts-yellow, currentColor) 42%, black);
-        --codexpp-project-red-text: color-mix(in srgb, var(--color-token-charts-red, currentColor) 82%, black);
-        --codexpp-project-pink-text: color-mix(in srgb, var(--pink-400, var(--color-token-charts-purple, currentColor)) 68%, black);
-        --codexpp-project-purple-text: color-mix(in srgb, var(--color-token-charts-purple, currentColor) 82%, black);
+        --codexpp-project-blue-text: var(--blue-400, #0285ff);
+        --codexpp-project-green-text: color-mix(in srgb, var(--green-400, #04b84c) 72%, black);
+        --codexpp-project-yellow-text: color-mix(in srgb, var(--yellow-400, #ffc300) 42%, black);
+        --codexpp-project-red-text: color-mix(in srgb, var(--red-400, #fa423e) 82%, black);
+        --codexpp-project-pink-text: color-mix(in srgb, var(--pink-400, #ff66ad) 68%, black);
+        --codexpp-project-purple-text: color-mix(in srgb, var(--purple-400, #924ff7) 82%, black);
         --codexpp-project-gray-text: color-mix(in srgb, var(--color-token-text-primary, currentColor) 25%, black);
       }
 
       .electron-dark {
-        --codexpp-project-blue-text: var(--color-token-text-link-foreground, var(--color-token-charts-blue));
-        --codexpp-project-green-text: var(--color-token-charts-green, var(--color-token-text-primary));
-        --codexpp-project-yellow-text: var(--color-token-charts-yellow, var(--color-token-text-primary));
-        --codexpp-project-red-text: color-mix(in srgb, var(--color-token-charts-red, currentColor) 86%, white);
-        --codexpp-project-pink-text: var(--pink-400, var(--color-token-charts-purple, var(--color-token-text-primary)));
-        --codexpp-project-purple-text: color-mix(in srgb, var(--color-token-charts-purple, currentColor) 88%, white);
+        --codexpp-project-blue-text: var(--blue-400, #0285ff);
+        --codexpp-project-green-text: var(--green-400, #04b84c);
+        --codexpp-project-yellow-text: var(--yellow-400, #ffc300);
+        --codexpp-project-red-text: color-mix(in srgb, var(--red-400, #fa423e) 86%, white);
+        --codexpp-project-pink-text: var(--pink-400, #ff66ad);
+        --codexpp-project-purple-text: color-mix(in srgb, var(--purple-400, #924ff7) 88%, white);
         --codexpp-project-gray-text: var(--color-token-text-secondary);
       }
 
@@ -7444,6 +7546,7 @@ const FEATURES = {
 
       [${ATTR}="row"][style*="--codexpp-project-blue-token-override"] {
         --color-accent-blue: var(--codexpp-project-blue-token-override);
+        --color-chart-blue: var(--codexpp-project-blue-token-override);
         --color-token-charts-blue: var(--codexpp-project-blue-token-override);
         --vscode-charts-blue: var(--codexpp-project-blue-token-override);
         --vscode-terminal-ansiBlue: var(--codexpp-project-blue-token-override);
@@ -7484,6 +7587,7 @@ const FEATURES = {
       }
 
       [${ATTR}="row"] [class*="bg-token-charts-blue"],
+      [${ATTR}="row"] [class*="bg-chart-blue"],
       [${ATTR}="row"] [class*="bg-token-accent"],
       [${ATTR}="row"] [class*="bg-token-link"],
       [${ATTR}="row"] [data-testid*="unread" i],
@@ -7492,6 +7596,7 @@ const FEATURES = {
       }
 
       [${ATTR}="row"] [class*="text-token-charts-blue"],
+      [${ATTR}="row"] [class*="text-chart-blue"],
       [${ATTR}="row"] [class*="text-token-accent"],
       [${ATTR}="row"] [class*="text-token-link"],
       [${ATTR}="row"] [data-testid*="unread" i],
@@ -7699,9 +7804,11 @@ const FEATURES = {
       row.querySelectorAll(
         [
           '[class*="bg-token-charts-blue"]',
+          '[class*="bg-chart-blue"]',
           '[class*="bg-token-accent"]',
           '[class*="bg-token-link"]',
           '[class*="text-token-charts-blue"]',
+          '[class*="text-chart-blue"]',
           '[class*="text-token-accent"]',
           '[class*="text-token-link"]',
           '[class*="unread" i]',
@@ -8252,27 +8359,27 @@ const FEATURES = {
     const PALETTE_FALLBACK = [
       {
         id: "blue",
-        value: "var(--color-token-charts-blue, var(--color-token-text-link-foreground))",
+        value: "var(--blue-400, #0285ff)",
       },
       {
         id: "green",
-        value: "var(--color-token-charts-green, var(--color-token-text-secondary))",
+        value: "var(--green-400, #04b84c)",
       },
       {
         id: "yellow",
-        value: "var(--color-token-charts-yellow, var(--color-token-text-secondary))",
+        value: "var(--yellow-400, #ffc300)",
       },
       {
         id: "red",
-        value: "var(--color-token-charts-red, var(--color-token-text-secondary))",
+        value: "var(--red-400, #fa423e)",
       },
       {
         id: "pink",
-        value: "var(--pink-400, var(--color-token-charts-purple, var(--color-token-text-link-foreground)))",
+        value: "var(--pink-400, #ff66ad)",
       },
       {
         id: "purple",
-        value: "var(--color-token-charts-purple, var(--color-token-text-link-foreground))",
+        value: "var(--purple-400, #924ff7)",
       },
       {
         id: "gray",
@@ -8791,6 +8898,14 @@ function writeSnapshot(api, snap) {
   api.storage.set("usage:snapshot", snap);
 }
 
+function formatCreditAmount(value) {
+  if (value == null) return null;
+  const text = String(value).trim();
+  if (!text) return null;
+  const numeric = Number(text);
+  return Number.isFinite(numeric) ? numeric.toFixed(1) : text;
+}
+
 /**
  * Render a single rotating usage box. Click toggles between 5h, Weekly, and points;
  * hover replaces the content with "Resets: HH:MM" for 5h or a points value for
@@ -8887,7 +9002,7 @@ function renderUsageBox(api, snapshot) {
     setText(
       pctEl,
       kind === "points"
-        ? entry?.value || "—"
+        ? formatCreditAmount(entry?.value) || "—"
         : remaining == null
           ? "—"
           : `${remaining}%`,
