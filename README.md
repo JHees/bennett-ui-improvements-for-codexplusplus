@@ -91,8 +91,9 @@ When CC Switch unified session history is enabled, CC Switch/Codex still own the
 ## Usage-data behavior
 
 - Saved quota snapshots are not presented as fresh data after startup.
-- The widget updates only after receiving current renderer or `/wham/usage` data.
+- The widget accepts only current main-account data from `/wham/usage`; persisted snapshots, renderer events, and page text are not used as quota sources.
 - Five-hour and weekly views show remaining percentage and reset-time tooltips.
+- The quota control reads only the main account `rate_limit`; `additional_rate_limits` such as GPT-5.3 Codex-specific limits are excluded.
 - Credit appears only when actual credit data is available.
 - API or pure-API providers show `API`; Bennett does not fabricate ChatGPT quota values.
 - The standalone `market-hide-usage-alert.js` script is no longer needed because that behavior is built in.

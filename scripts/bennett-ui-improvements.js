@@ -2428,9 +2428,9 @@ const FEATURES = {
    * Strategy
    * --------
    *  1. Fetch `/wham/usage` through Codex's existing renderer fetch bridge.
-   *  2. Parse the expanded/compact rendered labels only when the bridge is
-   *     unavailable or the request fails.
-   *  3. Persist the latest snapshot and refresh the mounted sidebar box in
+   *  2. Ignore model-specific renderer events and rendered labels; they can
+   *     represent a selected model rather than the main account.
+   *  3. Persist the latest current snapshot and refresh the mounted sidebar box in
    *     place. Re-mount only when Codex replaces the sidebar subtree.
    */
   "show-usage-in-sidebar"(api) {
@@ -2444,7 +2444,9 @@ const FEATURES = {
      * `resetAt` is whatever Codex shows verbatim (typically "HH:MM",
      * or "Wed, HH:MM" for weekly API data).
      */
-    let snapshot = readSnapshot(api);
+    // Quota values are account-scoped and must come from the current
+    // `/wham/usage` response. Do not render a previous snapshot at startup.
+    let snapshot = null;
     let mounted = null; // HTMLElement currently rendered in the sidebar
     let directUsageAvailable = false;
     let directUsageInFlight = false;
@@ -2928,12 +2930,9 @@ const FEATURES = {
         if (rateLimit.secondary_window) limits.push(rateLimit.secondary_window);
       };
 
+      // `additional_rate_limits` are model/product-specific (such as
+      // GPT-5.3 Codex) and must not replace the main account quota.
       pushLimit(status?.rate_limit);
-      if (Array.isArray(status?.additional_rate_limits)) {
-        for (const item of status.additional_rate_limits) {
-          pushLimit(item?.rate_limit);
-        }
-      }
 
       const five = pickClosestWindow(
         limits,
@@ -2989,25 +2988,6 @@ const FEATURES = {
         fiveHour: normalizeUsageWindow(five, "5h"),
         weekly: normalizeUsageWindow(weekly, "Weekly"),
       };
-    };
-
-    const applyUsageEvent = (message) => {
-      if (!message || typeof message !== "object") return false;
-      const windows = collectUsageWindows(message);
-      const points = normalizePoints(message);
-      if (!windows.length && !points) return false;
-      const partial = snapshotFromUsageWindows(windows);
-      if (points) partial.points = points;
-      if (!partial.fiveHour && !partial.weekly && !partial.points) return false;
-      directUsageAvailable = true;
-      applySnapshot(partial, "rate-limit-event");
-      return true;
-    };
-
-    const onUsageMessage = (event) => {
-      const data = event.data;
-      if (!data || typeof data !== "object") return;
-      applyUsageEvent(data);
     };
 
     const refreshUsageFromApi = async () => {
@@ -3702,11 +3682,6 @@ const FEATURES = {
       if (disposed) return;
       if (mode !== "api") await refreshUsageFromApi();
       if (disposed) return;
-      if (accountMode !== "api" && !directUsageAvailable) {
-        const grid = findBreakdownGrid();
-        if (grid) scanBreakdown(grid);
-        scanCompactUsage();
-      }
       ensureMounted();
     };
     const onMutate = () => {
@@ -3733,7 +3708,6 @@ const FEATURES = {
     obs.observe(document.documentElement, { childList: true, subtree: true });
     const interval = window.setInterval(onMutate, 15_000);
     window.addEventListener("focus", onMutate);
-    window.addEventListener("message", onUsageMessage);
     document.addEventListener("visibilitychange", onMutate);
 
     log("active", { snapshot });
@@ -3747,7 +3721,6 @@ const FEATURES = {
       window.clearInterval(interval);
       if (scheduleTimer) window.clearTimeout(scheduleTimer);
       window.removeEventListener("focus", onMutate);
-      window.removeEventListener("message", onUsageMessage);
       document.removeEventListener("visibilitychange", onMutate);
       if (mounted) {
         mounted.remove();

@@ -91,8 +91,9 @@ Bennett UI 可以让 Codex 显示更多近期会话，同时保留 Codex 原有�
 ## 额度数据规则
 
 - 启动后不会把保存的旧额度快照当作当前数据展示。
-- 只有收到当前 renderer 或 `/wham/usage` 数据后才更新控件。
+- 只接受当前 `/wham/usage` 返回的主账户数据；不会使用旧快照、renderer 事件或页面文本作为额度来源。
 - 5 小时和 Weekly 显示剩余百分比，悬停可查看重置时间。
+- 额度控件只读取主账户 `rate_limit`；`additional_rate_limits`（例如 GPT-5.3 Codex 专属额度）不会被合并进主账户额度。
 - 只有真实收到 Credit 数据时才显示点数。
 - API 或纯 API provider 显示 `API`，不会伪造 ChatGPT 官方额度。
 - `market-hide-usage-alert.js` 的功能已经内置，不再需要单独安装。
